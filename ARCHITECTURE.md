@@ -549,6 +549,43 @@ Keep the first deliverable small enough that a developer can understand the enti
 
 ---
 
+## Layering (the library)
+
+*Added after the milestones, while turning the platform into a library ([LIBRARY_PLAN.md](LIBRARY_PLAN.md)).*
+
+```text
+ user code ─────────── agents/*.ts (defineAgent), main.ts (createPlatform, workflow, listen)
+     │  imports "mini-agent-runtime" only
+     ▼
+ public API  src/lib/  createPlatform · AgentHandle / TaskHandle / WorkflowHandle · workflow builder
+     │                 listen() · platform.events · errors        (typed; validates in the caller)
+     │  wires, then calls
+     ▼
+ kernel  src/platform/  AgentRegistry · Inbox · Dispatcher · Supervisor · AgentFilesystem
+     │                  ListenerService · WorkflowService             (SQLite state, untyped payloads)
+     │  fork() + Zod-validated IPC (src/shared/protocol.ts)
+     ▼
+ runtime host  src/runtime/host.ts  imports the agent module named in INIT, validates each TASK's
+                                    input with the task's schema, runs it with a ctx (ctx.fs → FS_REQUEST)
+```
+
+- **Code defines behaviour; SQLite holds state.** Agent modules, restart policies, workflow
+  definitions, and listener targets are registered by name in code on every boot. The database
+  keeps identities, inboxes, grants, snapshots, and progress. A row whose code isn't registered
+  this boot is reported and left alone; a workflow whose code changed shape fails with
+  `definition changed` (it's matched by fingerprint).
+- **Recovery is explicit and ordered.** `platform.start()` runs it after code has registered
+  everything: close stale runtime rows, release stale claims, let workflows catch up, then start
+  listener scanning and autostart agents.
+- **One delivery path.** Everything a user sends goes through the durable inbox (at-least-once).
+  The supervisor's direct RPC is the dispatcher's transport, not a public API.
+- **Types end at the process boundary.** Inputs are validated with the same Zod schema twice: in the
+  caller's process (fail fast, nothing enqueued) and in the runtime host (the real contract). Outputs
+  are typed from handlers' return types, but cross IPC as JSON and aren't validated.
+- **Errors carry their retry semantics.** Invalid input, unknown tasks, permission denials, and
+  `PermanentError` fail a task on the current attempt; anything else is retried up to `maxAttempts`;
+  a workflow then reassigns the step to its next candidate.
+
 ## 10. Known Limitations and Next Steps
 
 All five milestones are implemented (see README). This section records what the prototype deliberately does not do yet.
@@ -599,10 +636,11 @@ All five milestones are implemented (see README). This section records what the 
 
 **Development**
 - Runtimes are started with `--import tsx` and there is no build step. That keeps development simple, but every runtime pays TypeScript transpilation cost at startup.
+- The package's `exports` point at TypeScript source, so a project outside this repo can't consume it without `tsx` (see the optional step 4.3 in the library plan).
 
 ### Next Steps
 
-1. **Library API.** In progress; see [LIBRARY_PLAN.md](LIBRARY_PLAN.md). Phase 0 (migrations, settlement events, permanent errors, explicit recovery, restart policies) Phase 1 (`defineAgent`, the generic runtime host, `AgentContext`), Phase 2 (`createPlatform`, typed handles and `send`, events), and Phase 3 (workflows and listeners defined in code) are done.
+1. **Packaging.** Build to `dist/` and fork compiled JS, so the library can be installed outside this repo (step 4.3 of [LIBRARY_PLAN.md](LIBRARY_PLAN.md)).
 2. **Step deadlines.** Give each workflow step a timeout that triggers reassignment to the next candidate agent, so a step held by an agent that never runs doesn't block the workflow.
 3. **Agent-initiated messaging and listeners.** Add IPC messages that let runtimes send inbox messages and register listeners, with a check on who may send to whom.
 4. **OS-enforced isolation.** Give each agent its own Unix user (or namespace/container), and turn platform grants into real file ownership, POSIX permissions, or ACLs, so the kernel enforces access instead of TypeScript.

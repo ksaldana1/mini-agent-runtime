@@ -34,7 +34,7 @@ async function attempt(agentId: string, what: string, [task, input]: [string, un
     const shown = typeof result === "string" ? JSON.stringify(result) : JSON.stringify(result, (_k, v) => (typeof v === "string" ? short(v) : v));
     console.log(`   ✓ ${names[agentId]}: ${what}\n       → ${shown}`);
   } catch (err) {
-    const msg = short((err as Error).message.replace(/^task \S+ failed: \w*Error: /, ""));
+    const msg = short((err as Error).message.replace(/^\w*Error: /, ""));
     console.log(`   ✗ ${names[agentId]}: ${what}\n       → ${msg}`);
   }
 }

@@ -1,34 +1,39 @@
 # mini-agent-runtime
 
 A toy local agent platform where agents behave like OS processes / Erlang actors.
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full brief. **Status: Milestone 5 (durable workflows). All five milestones from the brief are implemented.**
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full brief. **Status:** all five milestones from the
+brief are implemented, and the platform is packaged as a small typed library (see
+[LIBRARY_PLAN.md](LIBRARY_PLAN.md); phases 0–4 done).
 
-## Run
+## Library quickstart
 
-```bash
-npm install
-npm run demo:newsroom    # showcase: every feature at once (start here)
-npm run demo:lifecycle   # M1: create Agent A, start / task / stop / restart / crash / recover
-npm run demo:inbox       # M2: offline delivery, dedupe, crash redelivery, retries
-npm run demo:fs          # M3: private dirs, closed shared area, sharing one file, audit log
-npm run demo:listeners   # M4: files trigger tasks while the agent (or platform) is offline
-npm run demo:workflows   # M5: a workflow survives a crash, a platform restart, and a failing agent
-npm test                 # vitest
-npm run typecheck
+The platform is a small library ([LIBRARY_PLAN.md](LIBRARY_PLAN.md)): agents are typed modules,
+and the platform hands out typed, awaitable handles. The public entry point is the package itself
+(`"exports": "./src/lib/index.ts"`, run through `tsx`; there's no build step yet).
+`examples/newsroom/` is a complete example (`npm run demo:newsroom`).
+
+An agent is a module whose default export is `defineAgent(import.meta.url, { tasks })`:
+
+```ts
+// agents/notes.ts: loaded by the platform (for types) and by each runtime (to run tasks)
+import { z } from "zod";
+import { defineAgent } from "mini-agent-runtime";
+
+export default defineAgent(import.meta.url, {
+  tasks: {
+    save: {
+      input: z.object({ name: z.string(), text: z.string() }),
+      run: ({ name, text }, ctx) => ctx.fs.write(`~/notes/${name}.txt`, text),
+    },
+  },
+});
 ```
 
-Requires Node ≥ 24 (developed on 26). Run `npm run demo:lifecycle` twice: the second run
-reloads Agent A from `data/platform.db` and continues its incarnation count.
-
-## Library API (in progress)
-
-The platform is turning into a small library ([LIBRARY_PLAN.md](LIBRARY_PLAN.md)). Phases 0–3 are
-done: agents, typed sends, events, and workflows and listeners defined in code. The public entry
-point is the package itself (`"exports": "./src/lib/index.ts"`, run through `tsx`):
+The platform process registers agents, workflows, and listeners by name, then starts:
 
 ```ts
 import { createPlatform } from "mini-agent-runtime";
-import notes from "./agents/notes.ts"; // export default defineAgent(import.meta.url, { tasks: { save: ... } })
+import notes from "./agents/notes.ts";
 
 await using platform = createPlatform({ dataDir: "data" });
 const agent = platform.agent("notes", notes, { restart: "on-crash" }); // by name: same agent every boot
@@ -88,10 +93,35 @@ platform.events.onAny((name, e) => {
 });
 ```
 
+## Run
+
+```bash
+npm install
+npm run demo:newsroom    # the library showcase (examples/newsroom): every feature at once. Start here.
+# Tours of the internals: each drives the kernel classes (src/platform/) directly.
+npm run demo:lifecycle   # M1: create Agent A, start / task / stop / restart / crash / recover
+npm run demo:inbox       # M2: offline delivery, dedupe, crash redelivery, retries
+npm run demo:fs          # M3: private dirs, closed shared area, sharing one file, audit log
+npm run demo:listeners   # M4: files trigger tasks while the agent (or platform) is offline
+npm run demo:workflows   # M5: a workflow survives a crash, a platform restart, and a failing agent
+npm test                 # vitest
+npm run typecheck
+```
+
+The milestone demos predate the library. They wire the kernel by hand, which makes them the best
+way to see how each subsystem works, but not how to use the platform.
+
+Requires Node ≥ 24 (developed on 26). Run `npm run demo:lifecycle` twice: the second run
+reloads Agent A from `data/platform.db` and continues its incarnation count.
+
 ## How it fits together
 
+Three layers: the **public API** (`src/lib/`) wires and wraps the **kernel** (`src/platform/`),
+which forks **runtime hosts** (`src/runtime/host.ts`) that load agent modules. See
+[ARCHITECTURE.md § Layering](ARCHITECTURE.md#layering-the-library).
+
 ```text
-              platform process (src/demos/*.ts)
+              platform process (createPlatform, or src/demos/*.ts by hand)
  ┌───────────────────────────────────────────────────────┐
  │ AgentRegistry ── agents table      (persistent identity)
  │ Inbox ────────── inbox table       (durable, per agent identity)
@@ -127,6 +157,8 @@ platform.events.onAny((name, e) => {
 | `src/lib/workflows.ts` | The typed workflow builder, `WorkflowHandle`, and the listener builder. |
 | `src/lib/index.ts` | The public entry point. Exports the library, never kernel classes. |
 | `src/agents/toy.ts` | The toy agent the milestone demos use: `uppercase`, `transform`, and `fs` tasks. |
+| `src/demos/*.ts` | The milestone demos: tours of the kernel, wired by hand. |
+| `examples/newsroom/` | The library showcase: `main.ts` plus three agent modules, public API only. |
 
 ### Agent code: `defineAgent` and the runtime host
 

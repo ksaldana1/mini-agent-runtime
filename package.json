@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Toy local agent platform: agents as OS processes with persistent identity",
   "scripts": {
-    "demo:newsroom": "tsx src/demos/newsroom.ts",
+    "demo:newsroom": "tsx examples/newsroom/main.ts",
     "demo:lifecycle": "tsx src/demos/lifecycle.ts",
     "demo:inbox": "tsx src/demos/inbox.ts",
     "demo:fs": "tsx src/demos/filesystem.ts",

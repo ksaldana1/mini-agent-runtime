@@ -380,7 +380,7 @@ export class Supervisor extends EventEmitter {
   ): Promise<unknown> {
     const taskId = opts.taskId ?? randomUUID();
     const res = await this.request(this.running(agentId), taskId, { type: "TASK", taskId, task, input, attempt: opts.attempt ?? 1 });
-    if (res.type === "ERROR") throw new TaskError(`task ${taskId} failed: ${res.message}`, res.retryable ?? true);
+    if (res.type === "ERROR") throw new TaskError(res.message, res.retryable ?? true); // the caller knows which task
     if (res.type !== "TASK_COMPLETED") throw new Error(`expected TASK_COMPLETED, got ${res.type}`);
     return res.result;
   }

@@ -1,7 +1,6 @@
 # Library-ification Plan
 
-> **Status (2026-11-22):** plan and all design decisions (D1–D8) approved. **Phases 0–3 done; Phase 3 awaiting review.**
-> Next: **Phase 4**. Read [Handoff notes](#handoff-notes-for-a-fresh-session) first.
+> **Status (2026-11-22):** plan and all design decisions (D1–D8) approved. **Phases 0–4 done (4.3 packaging, optional, not started); Phase 4 awaiting review.** Read [Handoff notes](#handoff-notes-for-a-fresh-session) first.
 
 Turn the platform from "seven classes you wire by hand" into a small library with a typed,
 awaitable API. The current classes in `src/platform/` stay as the internal **kernel**. The new
@@ -193,14 +192,14 @@ These are internal changes that the later phases depend on. Every existing test 
 
 ## Phase 4: Acceptance and docs
 
-### ☐ 4.1 Rewrite the newsroom · M
+### ☑ 4.1 Rewrite the newsroom · M
 - Move it to `examples/newsroom/` with `main.ts` and `agents/{intake,editor,reviewer}.ts`, using only the public API.
 - **Done when:**
   - The same timeline and outcome as today, except junior denials are now 1 attempt each, thanks to 0.3.
   - No `until`/polling loops, no UUIDs in user code, no templates, no glue, no hand-written restart policy.
   - Roughly a third of the current line count.
 
-### ☐ 4.2 Docs · S
+### ☑ 4.2 Docs · S
 - README: a "Library quickstart" section at the top, with the milestone demos described as tours of the internals.
 - `ARCHITECTURE.md`: a new "Layering" section (public API ↔ kernel ↔ runtime host). Update §10: remove the items fixed here (restart policy, permanent errors, listener→workflow glue, polling) and add new ones (fingerprint mismatch fails the workflow, agent modules must be side-effect free).
 
@@ -242,10 +241,10 @@ Rough size: Phase 0 ≈ 1 milestone's worth, Phases 1–3 ≈ 1–1.5 each, Phas
 
 Read these before touching code.
 
-**Read first:** this file, then `ARCHITECTURE.md` (the original brief, plus §10 for known limitations), then `README.md` (how each subsystem works and why). The kernel code is in `src/platform/`. The best end-to-end example is `src/demos/newsroom.ts`.
+**Read first:** this file, then `ARCHITECTURE.md` (the original brief, plus §10 for known limitations), then `README.md` (how each subsystem works and why). The kernel code is in `src/platform/`. The best end-to-end example is `examples/newsroom/main.ts` (public API); `src/demos/*.ts` show the kernel wired by hand.
 
 **Where things stand:**
-- Milestones 1–5 from `ARCHITECTURE.md` are complete, and so is Phases 0–3: 147 tests passing, `tsc` clean, six demos working (`npm run demo:newsroom` plus one per milestone).
+- Milestones 1–5 from `ARCHITECTURE.md` are complete, and so is Phases 0–4: 147 tests passing, `tsc` clean, six demos working (`npm run demo:newsroom` plus one per milestone).
 - Phase 0 notes for later phases:
   - Supervisor events added: `restart-scheduled`, `gave-up`, `restart-failed`. Phase 2.4's `agent.gave-up` maps to `gave-up`.
   - `TaskError` (in `supervisor.ts`) carries `retryable`. The runtime marks `EACCES` (the `code` field on `FS_RESPONSE`) and invalid toy payloads as permanent. Phase 1.2's host should do the same for unknown tasks and Zod input failures.
@@ -271,6 +270,10 @@ Read these before touching code.
   - Public names: `platform.workflowRun(id)` reattaches to a run (`platform.workflow(name)` was taken by the builder). Events added: `workflow.settled`, `workflow.skipped`, `listener.error`, `listener.skipped`. `listener.fired` now has `listener`, plus nullable `agent` / `taskId` / `workflowId`.
   - The workflow builder needs `.input(schema)` first (it's the only method on `platform.workflow(name)`), which keeps `startWorkflow`'s input type simple.
   - For 4.1: name workflows and listeners stably (not per run) in the new example, and use `dataDir` under `examples/newsroom/data` so old demo rows in `data/` don't show up as orphans.
+- Phase 4 notes:
+  - The newsroom is `examples/newsroom/` (`main.ts` + `agents/{intake,editor,reviewer}.ts`), public API only. `main.ts` is 80 lines, down from 199, so about 40% rather than a third. The agent modules add 52. Intake became a workflow step, which removed the glue; the listener starts the workflow directly. It wipes `examples/newsroom/data` on each run (the data directory is gitignored).
+  - The kernel's `TaskError` message is now the runtime's own message, without a `task <id> failed:` prefix.
+  - 4.3 (packaging) is optional and not started.
 - Work is committed on `main`; commit at the end of each phase so every phase has a clean diff.
 
 **Environment quirks (macOS, not Linux):**
