@@ -42,9 +42,10 @@ export function score(
   a: Answer | undefined,
 ): { level: number; label: string; confidence: number } | null {
   if (a?.type !== "score") return null;
-  const label =
-    a.probabilities.find((p) => p.value === a.score)?.label ?? String(a.score);
-  return { level: a.score, label, confidence: a.confidence };
+  // `score` is the expected value over 0-based levels (e.g. 2.96), not an index:
+  // take the label from the most probable level instead.
+  const top = a.probabilities.reduce((best, p) => (p.probability > best.probability ? p : best));
+  return { level: a.score, label: top.label, confidence: a.confidence };
 }
 
 /**

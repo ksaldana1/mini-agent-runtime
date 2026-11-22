@@ -13,6 +13,10 @@ import qaDef from "./agents/qa.js";
 import responderDef from "./agents/responder.js";
 import triageDef from "./agents/triage.js";
 
+// Load ./.env if present. Agent processes are forked from this one, so they inherit it.
+try {
+  process.loadEnvFile();
+} catch {}
 if (!process.env.OPENAI_API_KEY) {
   console.error("Set OPENAI_API_KEY to run this example.");
   process.exit(1);
