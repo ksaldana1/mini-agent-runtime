@@ -13,6 +13,7 @@ import {
   type AgentHandle,
   type Platform,
   type PlatformEvents,
+  type TaskHandle,
   type WorkflowHandle,
   type WorkflowRef,
 } from "mini-agent-runtime";
@@ -108,8 +109,8 @@ describe("startWorkflow and WorkflowHandle (3.3)", () => {
     await p.start();
     const run = p.startWorkflow(flow, { name: "memo", text: "hello" });
     await expect(run.result()).resolves.toBe("hello");
-    expect(run.status()).toMatchObject({ workflow: "note-and-review", status: "completed", output: "hello" });
-    expect(run.steps().map((s) => [s.name, s.status, s.agent, s.assignment])).toEqual([
+    expect(run.info()).toMatchObject({ workflow: "note-and-review", status: "completed", output: "hello" });
+    expect(run.steps().map((s) => [s.name, s.status, s.agent?.name, s.assignment])).toEqual([
       ["save", "completed", "writer", 1],
       ["review", "completed", "senior", 2],
     ]);
@@ -175,7 +176,7 @@ describe("registered definitions across boots (3.2)", () => {
     const skipped = next(second, "workflow.skipped");
     await second.start();
     expect(await skipped).toMatchObject({ workflowId: run.id, workflow: "note-and-review", reason: expect.stringMatching(/not registered/) });
-    expect(second.workflowRun(run.id).status().status).toBe("running");
+    expect(second.workflowRun(run.id).info().status).toBe("running");
   });
 
   it("a changed definition (different steps) fails the running workflow", async () => {
@@ -204,27 +205,60 @@ describe("listeners defined in code (3.4)", () => {
     const clerk = p.agent("clerk", notes);
     expect(() => p.listen("too-early", { dir: inbox }).send(clerk.task("read"), (f) => ({ path: f.path }))).toThrow(/EACCES/);
     clerk.grant(inbox, "read");
-    p.listen("incoming", { dir: inbox }).send(clerk.task("read"), (f) => ({ path: f.path }));
+    const incoming = p.listen("incoming", { dir: inbox }).send(clerk.task("read"), (f) => ({ path: f.path }));
     await p.start();
 
     const fired = next(p, "listener.fired");
+    const taken = incoming.take(1);
     drop("a.txt", "alpha");
     const e = await fired;
-    expect(e).toMatchObject({ listener: "incoming", agent: "clerk", event: "created", path: `${inbox}/a.txt`, workflowId: null });
-    await expect(p.task(e.taskId!).result()).resolves.toBe("alpha");
+    expect(e).toMatchObject({ listener: "incoming", target: "task", agent: { id: clerk.id, name: "clerk" }, event: "created", path: `${inbox}/a.txt` });
+    if (e.target !== "task") throw new Error("expected a task firing");
+
+    const [task] = await taken;
+    expectTypeOf(task!).toEqualTypeOf<TaskHandle<string>>();
+    expect(task!.id).toBe(e.taskId);
+    await expect(task!.result()).resolves.toBe("alpha");
   });
 
   it(".startWorkflow() starts a run per file, with no agent permission needed", async () => {
     const p = boot();
     const { flow } = setup(p);
-    p.listen("submissions", { dir: inbox }).startWorkflow(flow, (f) => ({ name: f.name.replace(".txt", ""), text: `from ${f.path}` }));
+    const submissions = p.listen("submissions", { dir: inbox }).startWorkflow(flow, (f) => ({ name: f.name.replace(".txt", ""), text: `from ${f.path}` }));
     await p.start();
 
     const fired = next(p, "listener.fired");
+    const taken = submissions.take(1);
     drop("b.txt");
     const e = await fired;
-    expect(e).toMatchObject({ listener: "submissions", agent: null, taskId: null });
-    await expect(p.workflowRun(e.workflowId!).result()).resolves.toBe(`from ${inbox}/b.txt`);
+    expect(e).toMatchObject({ listener: "submissions", target: "workflow", workflow: "note-and-review" });
+    if (e.target !== "workflow") throw new Error("expected a workflow firing");
+
+    const [run] = await taken;
+    expectTypeOf(run!.input()).toEqualTypeOf<{ name: string; text: string }>();
+    expect(run!.id).toBe(e.workflowId);
+    await expect(run!.result()).resolves.toBe(`from ${inbox}/b.txt`);
+  });
+
+  it("onFire() streams what a listener starts until unsubscribed; take(0) resolves at once", async () => {
+    const p = boot();
+    const clerk = p.agent("clerk", notes);
+    clerk.grant(inbox, "read");
+    const incoming = p.listen("incoming", { dir: inbox }).send(clerk.task("read"), (f) => ({ path: f.path }));
+    await expect(incoming.take(0)).resolves.toEqual([]);
+    await p.start();
+
+    const seen: string[] = [];
+    const stop = incoming.onFire((task) => seen.push((task.info().input as { path: string }).path));
+    const two = incoming.take(2);
+    drop("x.txt");
+    drop("y.txt");
+    await two;
+    stop();
+    const three = incoming.take(1);
+    drop("z.txt");
+    await three;
+    expect(seen.sort()).toEqual([`${inbox}/x.txt`, `${inbox}/y.txt`]);
   });
 
   it("re-registering on the next boot doesn't refire for files already seen", async () => {
@@ -251,11 +285,11 @@ describe("listeners defined in code (3.4)", () => {
     // the workflow can't progress. Then the platform goes down.
     const first = boot();
     const { flow } = setup(first, { autostart: false });
-    first.listen("submissions", { dir: inbox }).startWorkflow(flow, (f) => ({ name: "doc", text: f.name }));
+    const submissions = first.listen("submissions", { dir: inbox }).startWorkflow(flow, (f) => ({ name: "doc", text: f.name }));
     await first.start();
-    const fired = next(first, "listener.fired");
+    const taken = submissions.take(1);
     drop("c.txt");
-    const runId = (await fired).workflowId!;
+    const runId = (await taken)[0]!.id;
     await first.close();
 
     // Boot 2: same code. The run is picked up and finishes; nothing fires twice.
@@ -301,6 +335,6 @@ describe("listeners defined in code (3.4)", () => {
     expect(a.inbox()).toHaveLength(0);
     l.resume();
     await next(p, "listener.fired");
-    expect(l.status()).toMatchObject({ state: "active", dir: inbox, lastError: null });
+    expect(l.info()).toMatchObject({ state: "active", dir: inbox, lastError: null });
   });
 });

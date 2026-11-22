@@ -83,7 +83,7 @@ describe("TaskRef (5.1)", () => {
     await p.start();
     const run = flow.start({ name: "memo", text: "quiet" });
     await expect(run.result()).resolves.toEqual({ loud: "QUIET" });
-    expect(run.steps().map((s) => [s.name, s.agent, s.assignment])).toEqual([
+    expect(run.steps().map((s) => [s.name, s.agent?.name, s.assignment])).toEqual([
       ["save", "writer", 1],
       ["review", "senior", 2],
     ]);
@@ -118,7 +118,14 @@ describe("typed workflow refs and handles (5.2)", () => {
     if (save.status !== "completed") throw new Error("expected save to be completed");
     expectTypeOf(save.result).toEqualTypeOf<Saved>();
     expect(save.result.path).toMatch(/notes\/memo\.txt$/);
-    expect(save).toMatchObject({ agent: "writer", error: null });
+    expect(save).toMatchObject({ agent: { name: "writer" }, error: null });
+
+    const saveTask = run.task("save");
+    expectTypeOf(saveTask).toEqualTypeOf<TaskHandle<Saved> | null>();
+    expect(saveTask!.info()).toMatchObject({ id: save.taskId, status: "completed", task: "save", agent: { name: "writer" } });
+    await expect(saveTask!.result()).resolves.toEqual(save.result);
+    // @ts-expect-error no such step
+    expect(() => run.task("nope")).toThrow(/no step "nope"/);
   });
 
   it("a step that isn't done yet has no result", () => {
@@ -127,6 +134,8 @@ describe("typed workflow refs and handles (5.2)", () => {
     const run = flow.start({ name: "m", text: "t" });
     expect(run.step("save")).toMatchObject({ status: "assigned", result: null, error: null });
     expect(run.step("review")).toMatchObject({ status: "waiting", result: null, error: null });
+    expect(run.task("save")!.info()).toMatchObject({ status: "pending", task: "save" });
+    expect(run.task("review")).toBeNull();
   });
 
   it("ref.run(id) refuses a run of another workflow, and one started with another definition", async () => {

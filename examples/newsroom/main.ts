@@ -33,24 +33,23 @@ const publish = platform
   .step("share", editor.task("share"), ({ steps }) => ({ path: steps.edit.path, with: senior.id }))
   .step("review", [junior.task("review"), senior.task("review")], ({ input, steps }) => ({ path: steps.edit.path, name: input.name }))
   .build();
-platform.listen("submissions", { dir: SUBMISSIONS }).startWorkflow(publish, (file) => ({ path: file.path, name: basename(file.name, ".txt") }));
+const submissions = platform.listen("submissions", { dir: SUBMISSIONS }).startWorkflow(publish, (file) => ({ path: file.path, name: basename(file.name, ".txt") }));
 
 // Timeline. Agent directories are shown as ~name instead of agents/<id>.
 const t0 = Date.now();
 platform.events.onAny((name, e) => {
   if (!/^(agent\.|listener\.fired|task\.attempt|workflow\.transition)/.test(name) || ("event" in e && e.event === "workflow_started")) return;
-  const who = "workflowId" in e && e.workflowId ? `[${publish.run(e.workflowId).input().name}]` : "agent" in e && e.agent ? e.agent : "";
+  const who = "workflowId" in e && e.workflowId ? `[${publish.run(e.workflowId).input().name}]` : "agent" in e ? e.agent.name : "";
   const what = "detail" in e ? `${e.event}: ${e.detail}` : "error" in e ? (e.error ?? "") : "pid" in e ? `#${e.incarnation} pid ${e.pid} ${"state" in e ? e.state : ""}` : "delayMs" in e ? `in ${e.delayMs}ms` : "path" in e ? e.path : "";
   console.log(`+${((Date.now() - t0) / 1000).toFixed(2)}s  ${name.padEnd(20)} ${who.padEnd(16)} ${staff.reduce((s, a) => s.replaceAll(`agents/${a.id}`, `~${a.name}`), what)}`);
 });
 const denials: Record<string, number> = {};
-platform.events.on("fs.denied", (e) => (denials[e.agent] = (denials[e.agent] ?? 0) + 1));
+platform.events.on("fs.denied", (e) => (denials[e.agent.name] = (denials[e.agent.name] ?? 0) + 1));
 
 // Chaos: kill the editor in the middle of its first edit.
-const stopChaos = platform.events.on("task.delivered", (e) => e.task === "edit" && (stopChaos(), setTimeout(() => process.kill(editor.status()!.pid, "SIGKILL"), 100)));
+const stopChaos = platform.events.on("task.delivered", (e) => e.task === "edit" && (stopChaos(), setTimeout(() => process.kill(editor.runtime()!.pid, "SIGKILL"), 100)));
 
-const runs: ReturnType<typeof publish.run>[] = [];
-const allFiled = new Promise((done) => platform.events.on("listener.fired", (e) => runs.push(publish.run(e.workflowId!)) === 3 && done(0)));
+const filed = submissions.take(3); // before any file arrives
 
 await platform.start(); // every agent is offline; the listener is already watching
 mkdirSync(join(DATA, SUBMISSIONS), { recursive: true });
@@ -60,14 +59,14 @@ await sleep(400);
 await Promise.all([intake.start(), editor.start()]);
 await sleep(1_500);
 await Promise.all([junior.start(), senior.start()]);
-await allFiled;
+const runs = await filed;
 const approved = await Promise.all(runs.map((run) => run.result()));
 
 console.table(runs.map((run, i) => ({
   article: run.input().name,
-  status: run.status().status,
-  "edit attempts": platform.task(run.step("edit").taskId!).status().attempts,
-  "reviewed by": run.step("review").agent,
+  status: run.info().status,
+  "edit attempts": run.task("edit")?.info().attempts,
+  "reviewed by": run.step("review").agent?.name,
   approved: readFileSync(join(DATA, approved[i]!.path), "utf8").replaceAll("\n", " / "),
 })));
 console.table(staff.map((a) => ({

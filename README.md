@@ -56,13 +56,15 @@ const review = platform.workflow("note-and-review")
   .step("review", [junior.task("read"), senior.task("read")], ({ steps }) => ({ path: steps.save.path })) // typed
   .build();
 
-platform.listen("submissions", { dir: "shared/documents/in" })
+const submissions = platform.listen("submissions", { dir: "shared/documents/in" })
   .startWorkflow(review, (file) => ({ name: file.name, text: file.path }));
+const firstTwo = submissions.take(2);           // typed WorkflowHandles for the next two files
 
 const run = review.start({ name: "memo", text: "hi" });
 const text = await run.result();                // the last step's output (or `.output(...)`'s)
 const save = run.step("save");
 if (save.status === "completed") save.result.path; // typed once completed
+run.task("save")?.info().attempts;              // the TaskHandle behind a step
 const again = review.run(run.id);               // typed reattach; checks the run is this workflow's
 ```
 
@@ -82,7 +84,9 @@ const again = review.run(run.id);               // typed reattach; checks the ru
   `ref.send(input)` validates `input` with the task's schema in the caller's process
   (`TaskInputError`, nothing enqueued), then enqueues `{ task, input }` durably and returns a
   `TaskHandle`. `result()` resolves once the task completes, across crashes and redeliveries, or
-  rejects with `TaskFailedError`. `platform.task(id)` reattaches to a task from an earlier process.
+  rejects with `TaskFailedError`; `info()` is its current durable state. `platform.task(id)`
+  reattaches to a task from an earlier process. Agents appear everywhere in the API (task info,
+  step info, events) as `{ id, name }` (`AgentRef`); `agent.runtime()` is its current process.
   Workflow steps and listeners take `TaskRef`s too, so validation happens in one place.
 - **Workflows** (`platform.workflow(name).input(schema).step(...).build()`) are typed end to end:
   each step's input function sees the parsed workflow input and the outputs of the steps before it,
@@ -93,17 +97,21 @@ const again = review.run(run.id);               // typed reattach; checks the ru
   a throw fails the workflow. `ref.start(input, { idempotencyKey })` (or
   `platform.startWorkflow(ref, ...)`) validates the input (`WorkflowInputError`) and returns a
   `WorkflowHandle`: `input()`, `step(name)` (typed `result` once `status === "completed"`),
-  `status`, `steps`, `events`, `result`. `ref.run(id)` reattaches with types, and throws
+  `task(name)` (the step's current `TaskHandle`, or null before it's assigned), `info`, `steps`,
+  `events`, `result`. `ref.run(id)` reattaches with types, and throws
   `WorkflowMismatchError` if the run belongs to another workflow or another definition (by
   fingerprint). `platform.workflowRun(id)` reattaches to any run, untyped.
 - **Listeners** (`platform.listen(name, { dir })`) either `.send(taskRef, fn)` (the task's agent must
-  be able to read `dir`) or `.startWorkflow(ref, fn)` (platform-owned, no permission check).
-- **Events.** `platform.events` re-emits kernel events with agent names. A complete timeline logger:
+  be able to read `dir`) or `.startWorkflow(ref, fn)` (platform-owned, no permission check). The
+  returned handle is typed by its target: `onFire(fn)` gets each `TaskHandle` or `WorkflowHandle`
+  the listener starts in this process, and `take(n)` resolves with the next `n` (call it before the
+  files arrive). The `listener.fired` event is a union on `target: "task" | "workflow"`.
+- **Events.** `platform.events` re-emits kernel events with agents as `{ id, name }`. A complete timeline logger:
 
 ```ts
 const t0 = Date.now();
 platform.events.onAny((name, e) => {
-  const who = "agent" in e ? e.agent : "workflow" in e ? e.workflow : "";
+  const who = "agent" in e ? e.agent.name : "workflow" in e ? e.workflow : "";
   const what =
     "error" in e && e.error ? e.error
     : "task" in e && e.task ? e.task

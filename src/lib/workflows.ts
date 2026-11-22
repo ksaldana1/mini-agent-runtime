@@ -11,15 +11,18 @@
  *   const run = publish.start({ path });
  *   const edit = run.step("edit");
  *   if (edit.status === "completed") edit.result.path; // typed
+ *   run.task("edit")?.info().attempts;                  // the task behind a step
  *
- *   platform.listen("submissions", { dir: "shared/documents/in" })
+ *   const submissions = platform.listen("submissions", { dir: "shared/documents/in" })
  *     .startWorkflow(publish, (file) => ({ path: file.path }));
+ *   const [first] = await submissions.take(1);          // typed WorkflowHandles
  */
 import { z } from "zod";
 import type { FileEvent as KernelFileEvent, Listener, ListenerEvent } from "../platform/listeners.js";
 import type { StepStatus, Workflow, WorkflowEvent, WorkflowStatus, WorkflowStep } from "../platform/workflows.js";
 import { WorkflowFailedError, WorkflowInputError, WorkflowMismatchError } from "./errors.js";
-import { taskRefImpl, type Platform, type TaskRef, type TaskRefImpl } from "./platform.js";
+import type { AgentRef, PlatformEvents } from "./events.js";
+import { taskRefImpl, TaskHandleImpl, type Platform, type TaskHandle, type TaskRef, type TaskRefImpl } from "./platform.js";
 
 // ── Public types ────────────────────────────────────────────────────────────
 
@@ -71,7 +74,7 @@ export interface WorkflowStepInfo {
   status: StepStatus;
   /** Which candidate holds the step (1 = first choice). */
   assignment: number;
-  agent: string | null;
+  agent: AgentRef | null;
   taskId: string | null;
   result: unknown;
   error: string | null;
@@ -96,7 +99,12 @@ export interface WorkflowHandle<In = unknown, Steps extends AnySteps = AnySteps,
   input(): In;
   /** One step by name. Throws for a name the workflow doesn't have. */
   step<N extends keyof Steps & string>(name: N): WorkflowStepSnapshot<Steps[N]>;
-  status(): WorkflowInfo;
+  /**
+   * The task currently holding a step (the latest candidate's, after a fallback), or null
+   * before the step is assigned. Throws for a name the workflow doesn't have.
+   */
+  task<N extends keyof Steps & string>(name: N): TaskHandle<Steps[N]> | null;
+  info(): WorkflowInfo;
   steps(): WorkflowStepInfo[];
   /** The append-only transition log. */
   events(): WorkflowEvent[];
@@ -124,12 +132,23 @@ export interface ListenOptions {
   includeExisting?: boolean;
 }
 
-export interface ListenerHandle {
+/**
+ * A registered listener. `Fired` is what it starts per file: a `TaskHandle` for `.send()`,
+ * a `WorkflowHandle` for `.startWorkflow()`.
+ */
+export interface ListenerHandle<Fired = unknown> {
   readonly name: string;
   readonly id: string;
-  status(): { state: "active" | "paused"; dir: string; lastScanAt: string | null; lastError: string | null };
+  info(): { state: "active" | "paused"; dir: string; lastScanAt: string | null; lastError: string | null };
   pause(): void;
   resume(): void;
+  /** Call `fn` with each task or run this listener starts in this process from now on. Returns an unsubscribe function. */
+  onFire(fn: (fired: Fired) => void): () => void;
+  /**
+   * Resolves with the next `count` tasks or runs this listener starts in this process.
+   * It counts from the call, so call it before the files arrive.
+   */
+  take(count: number): Promise<Fired[]>;
 }
 
 export interface ListenerBuilder {
@@ -137,14 +156,17 @@ export interface ListenerBuilder {
    * Enqueue `task` for each file event. Its agent must be allowed to read `dir` (a
    * listener reveals file names to its target).
    */
-  send<In>(task: TaskRef<In, unknown>, input: (file: FileEvent) => NoInfer<In>): ListenerHandle;
+  send<In, Out>(task: TaskRef<In, Out>, input: (file: FileEvent) => NoInfer<In>): ListenerHandle<TaskHandle<Out>>;
   /**
    * Start a run of `workflow` for each file event. Platform-owned: no agent's permission
    * is involved. The run is started in the same transaction that records the file as seen,
    * with idempotency key listener:<name>:<event>:<path>:<mtime>, so a crash can't lose or
    * duplicate it.
    */
-  startWorkflow<In>(workflow: WorkflowRef<In, any, unknown>, input: (file: FileEvent) => NoInfer<In>): ListenerHandle;
+  startWorkflow<In, Steps extends AnySteps, Out>(
+    workflow: WorkflowRef<In, Steps, Out>,
+    input: (file: FileEvent) => NoInfer<In>,
+  ): ListenerHandle<WorkflowHandle<In, Steps, Out>>;
 }
 
 // ── Builder ─────────────────────────────────────────────────────────────────
@@ -285,13 +307,13 @@ export class WorkflowHandleImpl<In = unknown, Steps extends AnySteps = AnySteps,
     this.workflow = wf.name;
   }
 
-  status(): WorkflowInfo {
+  info(): WorkflowInfo {
     this.platform.assertOpen();
     return toInfo(this.platform.kernel.workflows.get(this.id)!);
   }
 
   input(): In {
-    return this.status().input as In;
+    return this.info().input as In;
   }
 
   step<N extends keyof Steps & string>(name: N): WorkflowStepSnapshot<Steps[N]> {
@@ -305,13 +327,18 @@ export class WorkflowHandleImpl<In = unknown, Steps extends AnySteps = AnySteps,
     } as WorkflowStepSnapshot<Steps[N]>;
   }
 
+  task<N extends keyof Steps & string>(name: N): TaskHandle<Steps[N]> | null {
+    const { taskId } = this.step(name);
+    return taskId === null ? null : new TaskHandleImpl<Steps[N]>(this.platform, taskId);
+  }
+
   steps(): WorkflowStepInfo[] {
     this.platform.assertOpen();
     return this.platform.kernel.workflows.steps(this.id).map((s: WorkflowStep) => ({
       name: s.name,
       status: s.status,
       assignment: s.assignment,
-      agent: s.agentId && this.platform.nameOf(s.agentId),
+      agent: s.agentId === null ? null : this.platform.agentRef(s.agentId),
       taskId: s.inboxItemId,
       result: s.result,
       error: s.error,
@@ -333,11 +360,13 @@ export class WorkflowHandleImpl<In = unknown, Steps extends AnySteps = AnySteps,
   }
 }
 
-export class ListenerHandleImpl implements ListenerHandle {
+export class ListenerHandleImpl<Fired> implements ListenerHandle<Fired> {
   constructor(
     private readonly platform: Platform,
     readonly name: string,
     readonly id: string,
+    /** Builds the handle for one firing of this listener (undefined for another target kind). */
+    private readonly toFired: (e: PlatformEvents["listener.fired"]) => Fired | undefined,
   ) {}
 
   private row(): Listener {
@@ -345,9 +374,29 @@ export class ListenerHandleImpl implements ListenerHandle {
     return this.platform.kernel.listeners.get(this.id)!;
   }
 
-  status() {
+  info() {
     const l = this.row();
     return { state: l.state, dir: l.path, lastScanAt: l.lastScanAt, lastError: l.lastError };
+  }
+
+  onFire(fn: (fired: Fired) => void): () => void {
+    return this.platform.events.on("listener.fired", (e) => {
+      if (e.listenerId !== this.id) return;
+      const fired = this.toFired(e);
+      if (fired !== undefined) fn(fired);
+    });
+  }
+
+  take(count: number): Promise<Fired[]> {
+    if (count <= 0) return Promise.resolve([]);
+    return new Promise((resolve) => {
+      const fired: Fired[] = [];
+      const stop = this.onFire((f) => {
+        if (fired.push(f) < count) return;
+        stop();
+        resolve(fired);
+      });
+    });
   }
 
   pause(): void {

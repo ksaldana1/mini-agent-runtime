@@ -34,10 +34,10 @@ describe("createPlatform lifecycle", () => {
   it("boots, registers, starts, runs a task, and closes", async () => {
     const platform = boot();
     const agent = platform.agent("notes", notes);
-    expect(agent.status()).toBeUndefined(); // nothing runs before start()
+    expect(agent.runtime()).toBeUndefined(); // nothing runs before start()
 
     await platform.start();
-    expect(agent.status()).toMatchObject({ state: "running", incarnation: 1 });
+    expect(agent.runtime()).toMatchObject({ state: "running", incarnation: 1 });
 
     const out = await agent.send("save", { name: "a", text: "hello" }).result();
     expect(out).toMatchObject({ path: `agents/${agent.id}/notes/a.txt`, bytes: 5, attempt: 1, incarnation: 1 });
@@ -54,7 +54,7 @@ describe("createPlatform lifecycle", () => {
       await using platform = createPlatform({ dataDir });
       const agent = platform.agent("notes", notes);
       await platform.start();
-      pid = agent.status()!.pid;
+      pid = agent.runtime()!.pid;
     }
     expect(() => process.kill(pid!, 0)).toThrow(); // runtime is gone
   });
@@ -70,7 +70,7 @@ describe("createPlatform lifecycle", () => {
     const a2 = second.agent("notes", notes);
     expect(a2.id).toBe(a1.id);
     const reattached = second.task<{ path: string }>(pending.id);
-    expect(reattached.status()).toMatchObject({ status: "pending", task: "save", agent: "notes" });
+    expect(reattached.info()).toMatchObject({ status: "pending", task: "save", agent: { id: a2.id, name: "notes" } });
 
     await second.start();
     await expect(reattached.result()).resolves.toMatchObject({ path: `agents/${a1.id}/notes/later.txt` });
@@ -83,7 +83,7 @@ describe("createPlatform lifecycle", () => {
     await platform.start();
     await expect(platform.start()).rejects.toThrow(/already started/);
     await agent.start();
-    expect(agent.status()!.state).toBe("running");
+    expect(agent.runtime()!.state).toBe("running");
   });
 
   it("an agent registered after start() is started right away", async () => {
@@ -105,7 +105,7 @@ describe("AgentHandle", () => {
     const a2 = second.agent("notes", notes);
     await second.start();
     expect(a2.id).toBe(a1.id);
-    expect(a2.status()!.incarnation).toBe(2);
+    expect(a2.runtime()!.incarnation).toBe(2);
     expect(a2.history().map((r) => r.incarnation)).toEqual([1, 2]);
     expect(a2.history()[0]!.exitedAt).not.toBeNull();
   });
@@ -135,7 +135,7 @@ describe("AgentHandle", () => {
     const agent = platform.agent("notes", notes);
     await platform.start();
     await agent.stop();
-    expect(agent.status()!.state).toBe("exited");
+    expect(agent.runtime()!.state).toBe("exited");
     const t = agent.send("save", { name: "n", text: "t" });
     expect(agent.inbox("pending").map((i) => i.id)).toEqual([t.id]);
     expect((await agent.restart()).incarnation).toBe(2);
@@ -169,10 +169,10 @@ describe("send and TaskHandle", () => {
 
   it("result() survives a runtime crash and redelivery", async () => {
     const handle = agent.send("save", { name: "slow", text: "x", delayMs: 300 });
-    platform.events.once("task.delivered", () => setTimeout(() => process.kill(agent.status()!.pid, "SIGKILL"), 50));
+    platform.events.once("task.delivered", () => setTimeout(() => process.kill(agent.runtime()!.pid, "SIGKILL"), 50));
     const out = await handle.result();
     expect(out).toMatchObject({ attempt: 2, incarnation: 2 });
-    expect(handle.status()).toMatchObject({ status: "completed", attempts: 2 });
+    expect(handle.info()).toMatchObject({ status: "completed", attempts: 2 });
   });
 
   it("an idempotency key returns the original task", () => {
@@ -203,7 +203,7 @@ describe("platform.events", () => {
   it("re-emits kernel events with agent names", async () => {
     const platform = boot();
     const seen: string[] = [];
-    platform.events.onAny((name: PlatformEventName, e) => seen.push(`${name}:${"agent" in e ? e.agent : ""}`));
+    platform.events.onAny((name: PlatformEventName, e) => seen.push(`${name}:${"agent" in e ? e.agent.name : ""}`));
     const denied: unknown[] = [];
     platform.events.on("fs.denied", (e) => denied.push(e));
 
@@ -213,7 +213,7 @@ describe("platform.events", () => {
     const { path } = await writer.send("save", { name: "m", text: "t" }).result();
     await reader.send("read", { path }).result().catch(() => {});
 
-    process.kill(writer.status()!.pid, "SIGKILL");
+    process.kill(writer.runtime()!.pid, "SIGKILL");
     await new Promise<void>((r) => platform.events.once("agent.ready", () => r()));
 
     expect(seen).toEqual(
@@ -230,6 +230,6 @@ describe("platform.events", () => {
         "agent.restarting:writer",
       ]),
     );
-    expect(denied).toEqual([{ agent: "reader", agentId: reader.id, op: "read", path, reason: "no grant" }]);
+    expect(denied).toEqual([{ agent: { id: reader.id, name: "reader" }, op: "read", path, reason: "no grant" }]);
   });
 });

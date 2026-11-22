@@ -30,7 +30,7 @@ import {
   type TaskOutput,
 } from "./agent.js";
 import { AgentConfigError, TaskFailedError, TaskInputError } from "./errors.js";
-import { PlatformEventEmitter, type TaskStatus } from "./events.js";
+import { PlatformEventEmitter, type AgentRef, type PlatformEvents, type TaskStatus } from "./events.js";
 import {
   ListenerHandleImpl,
   toFileEvent,
@@ -82,10 +82,8 @@ export interface RuntimeStatus {
 
 export interface TaskInfo {
   id: string;
-  agent: string;
-  agentId: string;
-  /** null if the inbox item isn't a { task, input } payload. */
-  task: string | null;
+  agent: AgentRef;
+  task: string;
   input: unknown;
   status: TaskStatus;
   attempts: number;
@@ -97,10 +95,10 @@ export interface TaskInfo {
 
 export interface TaskHandle<Out = unknown> {
   readonly id: string;
-  readonly agent: string;
-  readonly task: string | null;
+  readonly agent: AgentRef;
+  readonly task: string;
   /** Current durable state of the task. */
-  status(): TaskInfo;
+  info(): TaskInfo;
   /**
    * Resolves with the task's result once it completes, however many deliveries that
    * takes. Rejects with TaskFailedError if it ends up failed. No polling: it waits on
@@ -114,7 +112,7 @@ export interface TaskHandle<Out = unknown> {
  * listeners, or `send()` it. Get one with `agent.task(name)`.
  */
 export interface TaskRef<In = unknown, Out = unknown> {
-  readonly agent: { readonly id: string; readonly name: string };
+  readonly agent: AgentRef;
   readonly task: string;
   /**
    * Durably enqueue this task. The input is validated against the task's schema first;
@@ -134,7 +132,7 @@ export interface AgentHandle<D extends AgentDefinition = AgentDefinition> {
   stop(): Promise<void>;
   restart(): Promise<RuntimeStatus>;
   /** The current (or last) runtime of this agent in this process, if any. */
-  status(): RuntimeStatus | undefined;
+  runtime(): RuntimeStatus | undefined;
   /** Every runtime incarnation this agent has had, oldest first. */
   history(): RuntimeRecord[];
   /** Platform grant: let this agent read or write a path (and everything under it). */
@@ -219,7 +217,7 @@ export class Platform implements AsyncDisposable {
       this.autostart.add(name);
       // Registered after start(): reconcile right away.
       if (this.lifecycle === "started") {
-        handle.start().catch((err: Error) => this.events.emit("agent.start-failed", { agent: name, agentId: agent.id, error: err.message }));
+        handle.start().catch((err: Error) => this.events.emit("agent.start-failed", { agent: { id: agent.id, name }, error: err.message }));
       }
     }
     return handle;
@@ -292,33 +290,44 @@ export class Platform implements AsyncDisposable {
   listen(name: string, opts: ListenOptions): ListenerBuilder {
     this.assertOpen();
     if (this.listenerNames.has(name)) throw new Error(`listener "${name}" is already registered in this process`);
-    const register = (target: Parameters<ListenerService["register"]>[1]["target"]): ListenerHandle => {
+    // Typed by the builder's signatures: send() fires TaskHandles, startWorkflow() WorkflowHandles.
+    const register = (
+      target: Parameters<ListenerService["register"]>[1]["target"],
+      toFired: (e: PlatformEvents["listener.fired"]) => unknown,
+    ): ListenerHandle<never> => {
       if (this.listenerNames.has(name)) throw new Error(`listener "${name}" is already registered in this process`);
       const l: Listener = this.kernel.listeners.register(name, { path: opts.dir, events: opts.events, includeExisting: opts.includeExisting, target });
       this.listenerNames.add(name);
-      return new ListenerHandleImpl(this, name, l.id);
+      return new ListenerHandleImpl(this, name, l.id, toFired) as never;
     };
-    return {
+    const builder: ListenerBuilder = {
       send: (task, input) => {
         const ref = taskRefImpl(task);
-        return register({
-          kind: "agent",
-          agentId: ref.agent.id,
-          payload: (e) => {
-            const value = input(toFileEvent(e));
-            ref.validate(value);
-            return { task: ref.task, input: value };
+        return register(
+          {
+            kind: "agent",
+            agentId: ref.agent.id,
+            payload: (e) => {
+              const value = input(toFileEvent(e));
+              ref.validate(value);
+              return { task: ref.task, input: value };
+            },
           },
-        });
+          (e) => (e.target === "task" ? new TaskHandleImpl(this, e.taskId) : undefined),
+        );
       },
       startWorkflow: (workflow, input) => {
         if (!this.workflowSchemas.has(workflow.name)) throw new Error(`listener ${name}: workflow ${workflow.name} is not registered in this platform`);
-        return register({
-          kind: "platform",
-          fire: (e: Parameters<typeof toFileEvent>[0], idempotencyKey: string) => this.startRun(workflow.name, input(toFileEvent(e)), { idempotencyKey }),
-        });
+        return register(
+          {
+            kind: "platform",
+            fire: (e: Parameters<typeof toFileEvent>[0], idempotencyKey: string) => this.startRun(workflow.name, input(toFileEvent(e)), { idempotencyKey }),
+          },
+          (e) => (e.target === "workflow" ? new WorkflowHandleImpl(this, e.workflowId) : undefined),
+        );
       },
     };
+    return builder;
   }
 
   // ── Tasks ─────────────────────────────────────────────────────────────────
@@ -385,14 +394,19 @@ export class Platform implements AsyncDisposable {
   }
 
   /** @internal */
+  agentRef(agentId: string): AgentRef {
+    return { id: agentId, name: this.nameOf(agentId) };
+  }
+
+  /** @internal */
   taskInfo(item: InboxItem): TaskInfo {
     const payload = item.payload as { task?: unknown; input?: unknown } | null;
     const isTask = typeof payload === "object" && payload !== null && typeof payload.task === "string";
     return {
       id: item.id,
-      agent: this.nameOf(item.recipientAgentId),
-      agentId: item.recipientAgentId,
-      task: isTask ? (payload.task as string) : null,
+      agent: this.agentRef(item.recipientAgentId),
+      // Every item sent through this API is a { task, input } payload; "?" marks one that isn't.
+      task: isTask ? (payload.task as string) : "?",
       input: isTask ? payload.input : item.payload,
       status: item.status,
       attempts: item.attempts,
@@ -409,29 +423,28 @@ export class Platform implements AsyncDisposable {
     const e = this.events;
     const taskName = (item: InboxItem) => {
       const p = item.payload as { task?: unknown } | null;
-      return typeof p?.task === "string" ? p.task : null;
+      return typeof p?.task === "string" ? p.task : "?";
     };
 
     supervisor.on("runtime-ready", (r: RuntimeInfo) =>
-      e.emit("agent.ready", { agent: this.nameOf(r.agentId), agentId: r.agentId, incarnation: r.incarnation, pid: r.pid }),
+      e.emit("agent.ready", { agent: this.agentRef(r.agentId), incarnation: r.incarnation, pid: r.pid }),
     );
     supervisor.on("runtime-exit", (r: RuntimeInfo) =>
-      e.emit("agent.exited", { agent: this.nameOf(r.agentId), agentId: r.agentId, incarnation: r.incarnation, pid: r.pid, state: r.state }),
+      e.emit("agent.exited", { agent: this.agentRef(r.agentId), incarnation: r.incarnation, pid: r.pid, state: r.state }),
     );
     supervisor.on("restart-scheduled", (r: { agentId: string; attempt: number; delayMs: number }) =>
-      e.emit("agent.restarting", { agent: this.nameOf(r.agentId), ...r }),
+      e.emit("agent.restarting", { agent: this.agentRef(r.agentId), attempt: r.attempt, delayMs: r.delayMs }),
     );
     supervisor.on("gave-up", (r: { agentId: string; crashes: number; windowMs: number }) =>
-      e.emit("agent.gave-up", { agent: this.nameOf(r.agentId), ...r }),
+      e.emit("agent.gave-up", { agent: this.agentRef(r.agentId), crashes: r.crashes, windowMs: r.windowMs }),
     );
     inbox.on("enqueued", (item: InboxItem) =>
-      e.emit("task.enqueued", { taskId: item.id, agent: this.nameOf(item.recipientAgentId), agentId: item.recipientAgentId, task: taskName(item), input: this.taskInfo(item).input }),
+      e.emit("task.enqueued", { taskId: item.id, agent: this.agentRef(item.recipientAgentId), task: taskName(item), input: this.taskInfo(item).input }),
     );
     dispatcher.on("delivered", ({ item, incarnation }: { item: InboxItem; incarnation: number }) =>
       e.emit("task.delivered", {
         taskId: item.id,
-        agent: this.nameOf(item.recipientAgentId),
-        agentId: item.recipientAgentId,
+        agent: this.agentRef(item.recipientAgentId),
         task: taskName(item),
         attempt: item.attempts,
         incarnation,
@@ -440,8 +453,7 @@ export class Platform implements AsyncDisposable {
     dispatcher.on("failed", ({ item, error, retryable, willRetry }: { item: InboxItem; error: string; retryable: boolean; willRetry: boolean }) =>
       e.emit("task.attempt-failed", {
         taskId: item.id,
-        agent: this.nameOf(item.recipientAgentId),
-        agentId: item.recipientAgentId,
+        agent: this.agentRef(item.recipientAgentId),
         task: taskName(item),
         error,
         retryable,
@@ -451,8 +463,7 @@ export class Platform implements AsyncDisposable {
     inbox.on("settled", (item: InboxItem) =>
       e.emit("task.settled", {
         taskId: item.id,
-        agent: this.nameOf(item.recipientAgentId),
-        agentId: item.recipientAgentId,
+        agent: this.agentRef(item.recipientAgentId),
         task: taskName(item),
         status: item.status as "completed" | "failed",
         attempts: item.attempts,
@@ -466,10 +477,9 @@ export class Platform implements AsyncDisposable {
         listenerId: listener.id,
         event,
         path,
-        agent: listener.targetAgentId && this.nameOf(listener.targetAgentId),
-        agentId: listener.targetAgentId,
-        taskId: item?.id ?? null,
-        workflowId: typeof result === "string" ? result : null,
+        ...(item
+          ? { target: "task" as const, agent: this.agentRef(item.recipientAgentId), taskId: item.id }
+          : { target: "workflow" as const, workflow: workflows.get(result as string)?.name ?? "?", workflowId: result as string }),
       }),
     );
     listeners.on("error", ({ listener, path, error }: { listener: Listener; path: string; error: Error }) =>
@@ -487,7 +497,7 @@ export class Platform implements AsyncDisposable {
     workflows.on("skipped", (w: { workflowId: string; name: string; reason: string }) =>
       e.emit("workflow.skipped", { workflowId: w.workflowId, workflow: w.name, reason: w.reason }),
     );
-    fs.on("denied", (a: AuditEntry) => e.emit("fs.denied", { agent: this.nameOf(a.agentId), agentId: a.agentId, op: a.op, path: a.path, reason: a.reason }));
+    fs.on("denied", (a: AuditEntry) => e.emit("fs.denied", { agent: this.agentRef(a.agentId), op: a.op, path: a.path, reason: a.reason }));
   }
 }
 
@@ -514,7 +524,7 @@ class AgentHandleImpl<D extends AgentDefinition> implements AgentHandle<D> {
     return toStatus(await this.platform.kernel.supervisor.restart(this.id));
   }
 
-  status(): RuntimeStatus | undefined {
+  runtime(): RuntimeStatus | undefined {
     const info = this.platform.kernel.supervisor.status(this.id);
     return info && toStatus(info);
   }
@@ -553,7 +563,7 @@ class AgentHandleImpl<D extends AgentDefinition> implements AgentHandle<D> {
 export class TaskRefImpl<In, Out> implements TaskRef<In, Out> {
   constructor(
     private readonly platform: Platform,
-    readonly agent: { readonly id: string; readonly name: string },
+    readonly agent: AgentRef,
     readonly task: string,
     private readonly schema: z.ZodType,
   ) {}
@@ -580,20 +590,21 @@ export function taskRefImpl(ref: TaskRef<any, any>): TaskRefImpl<unknown, unknow
   return ref as TaskRefImpl<unknown, unknown>;
 }
 
-class TaskHandleImpl<Out> implements TaskHandle<Out> {
-  readonly agent: string;
-  readonly task: string | null;
+/** @internal */
+export class TaskHandleImpl<Out> implements TaskHandle<Out> {
+  readonly agent: AgentRef;
+  readonly task: string;
 
   constructor(
     private readonly platform: Platform,
     readonly id: string,
   ) {
-    const info = this.status();
+    const info = this.info();
     this.agent = info.agent;
     this.task = info.task;
   }
 
-  status(): TaskInfo {
+  info(): TaskInfo {
     this.platform.assertOpen();
     return this.platform.taskInfo(this.platform.kernel.inbox.get(this.id)!);
   }
@@ -602,7 +613,7 @@ class TaskHandleImpl<Out> implements TaskHandle<Out> {
     this.platform.assertOpen();
     const item = await this.platform.kernel.inbox.waitFor(this.id);
     if (item.status === "completed") return item.result as Out;
-    throw new TaskFailedError(this.id, this.task ?? "?", this.agent, item.lastError, item.attempts);
+    throw new TaskFailedError(this.id, this.task, this.agent.name, item.lastError, item.attempts);
   }
 }
 

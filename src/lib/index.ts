@@ -47,4 +47,4 @@ export {
   WorkflowMismatchError,
 } from "./errors.js";
 
-export type { PlatformEventName, PlatformEvents, TaskStatus } from "./events.js";
+export type { AgentRef, PlatformEventName, PlatformEvents, TaskStatus } from "./events.js";

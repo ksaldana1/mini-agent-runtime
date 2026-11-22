@@ -53,10 +53,10 @@ const handle = platform
     qa: c.helpfulness ? `${c.verdict} (${c.helpfulness.label})` : c.verdict,
   }))
   .build();
-platform.listen("inbox", { dir: INBOX }).startWorkflow(handle, (file) => ({ path: file.path, name: basename(file.name, ".txt") }));
+const inbox = platform.listen("inbox", { dir: INBOX }).startWorkflow(handle, (file) => ({ path: file.path, name: basename(file.name, ".txt") }));
 
-platform.events.on("task.delivered", (e) => console.log(`  ${e.agent.padEnd(10)} ${e.task} (attempt ${e.attempt})`));
-platform.events.on("task.attempt-failed", (e) => console.log(`  ${e.agent.padEnd(10)} ${e.task} ✗ ${e.error}`));
+platform.events.on("task.delivered", (e) => console.log(`  ${e.agent.name.padEnd(10)} ${e.task} (attempt ${e.attempt})`));
+platform.events.on("task.attempt-failed", (e) => console.log(`  ${e.agent.name.padEnd(10)} ${e.task} ✗ ${e.error}`));
 
 const TICKETS: Record<string, string> = {
   "double-charge": "Hi, I was charged twice for my Pro plan this month (two $49 charges on the 3rd). Can you fix this?",
@@ -66,15 +66,12 @@ const TICKETS: Record<string, string> = {
   "leaked-key": "My integration fails with 401. Here's my key so you can test: sk-live-9f8a7b6c5d4e3f2a1b0c. What am I doing wrong?",
 };
 
-const runs: ReturnType<typeof handle.run>[] = [];
-const allStarted = new Promise((done) =>
-  platform.events.on("listener.fired", (e) => runs.push(handle.run(e.workflowId!)) === Object.keys(TICKETS).length && done(0)),
-);
+const started = inbox.take(Object.keys(TICKETS).length); // before any ticket arrives
 
 await platform.start();
 mkdirSync(join(DATA, INBOX), { recursive: true });
 for (const [name, text] of Object.entries(TICKETS)) writeFileSync(join(DATA, INBOX, `${name}.txt`), text);
-await allStarted;
+const runs = await started;
 const results = await Promise.allSettled(runs.map((run) => run.result()));
 console.table(results.map((r, i) => (r.status === "fulfilled" ? r.value : { ticket: runs[i]!.input().name, error: String(r.reason) })));
 console.log(`\nDrafts: ${join(DATA, DRAFTS)}\nEscalations: ${join(DATA, ESCALATIONS)}`);
