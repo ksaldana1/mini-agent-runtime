@@ -7,6 +7,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full brief. **Status: Milestone 5
 
 ```bash
 npm install
+npm run demo:newsroom    # showcase: every feature at once (start here)
 npm run demo:lifecycle   # M1: create Agent A, start / task / stop / restart / crash / recover
 npm run demo:inbox       # M2: offline delivery, dedupe, crash redelivery, retries
 npm run demo:fs          # M3: private dirs, closed shared area, sharing one file, audit log
