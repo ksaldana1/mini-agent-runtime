@@ -2,3 +2,6 @@ node_modules/
 data/
 *.db
 examples/newsroom/data/
+examples/support-desk/data/
+.env
+
