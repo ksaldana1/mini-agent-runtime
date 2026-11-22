@@ -546,3 +546,50 @@ Include:
 Keep the first deliverable small enough that a developer can understand the entire system by reading the code.
 
 **Do not proceed to Milestone 2 until Milestone 1 works and has been reviewed.**
+
+---
+
+## 10. Known Limitations and Next Steps
+
+All five milestones are implemented (see README). This section records what the prototype deliberately does not do yet.
+
+### Known Limitations
+
+**Isolation and security**
+- `child_process.fork()` is not a sandbox. Runtimes are trusted code running as the same Unix user as the platform.
+- Filesystem permissions are enforced by the platform, not the OS. A runtime could bypass them by using `node:fs` directly, including reading `data/platform.db`.
+- The symlink check happens before the file operation, so a symlink created in between could slip through (a time-of-check/time-of-use race).
+- Sender identity is validated, but nothing restricts which agents may send to which.
+
+**Lifecycle**
+- The supervisor detects crashes but never restarts agents itself. Restarting is the caller's job.
+- Stopping an agent doesn't wait for its in-flight task. The task is redelivered, and that delivery counts as an attempt.
+
+**Inbox and delivery**
+- Permanent errors (for example `EACCES`) are retried like temporary ones, using up all attempts before giving up.
+- `failed` items just stay in the inbox with their last error. There is no separate dead-letter handling.
+- Delivery is strictly first-in, first-out per agent, with no priorities.
+- Only the platform can call `inbox.send`. Agents can't send messages over IPC.
+
+**Filesystem**
+- No locking or versioning. Writes are atomic (temp file + rename), but with concurrent writers the last write wins.
+- Text files only (UTF-8 strings over IPC), with no size limits.
+
+**Listeners**
+- Only the platform can register listeners. Agents can't create their own.
+- Listeners only watch files: no timers, no agent-to-agent events, and deleted files aren't reported.
+- Changes are detected by modification time and size, so a rewrite that keeps both the same is missed.
+- Every scan lists the whole watched tree, which gets slow for large trees.
+
+**Workflows**
+- Sequential only: no branching, parallel steps, timers, or cancellation.
+- Steps have no deadline. A step assigned to an agent that never starts waits forever, because reassignment only happens after a failure.
+- Step outputs have no schema. A template that refers to a missing field is left unfilled.
+
+### Next Steps
+
+1. **Supervisor restart policies.** Restart crashed runtimes automatically, Erlang-style (for example, one-for-one restarts with backoff and a cap on restarts within a time window).
+2. **Separate permanent from temporary errors.** Let a task report an error as non-retryable so the inbox fails it right away, and a workflow can reassign it without spending all attempts.
+3. **Step deadlines.** Give each workflow step a timeout that triggers reassignment to the next candidate agent, so a step held by an agent that never runs doesn't block the workflow.
+4. **Agent-initiated messaging and listeners.** Add IPC messages that let runtimes send inbox messages and register listeners, with a check on who may send to whom.
+5. **OS-enforced isolation.** Give each agent its own Unix user (or namespace/container), and turn platform grants into real file ownership, POSIX permissions, or ACLs, so the kernel enforces access instead of TypeScript.

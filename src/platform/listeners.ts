@@ -5,6 +5,7 @@ import type { Db } from "./database.js";
 import type { AgentFilesystem } from "./filesystem.js";
 import type { AgentRegistry } from "./identity.js";
 import type { Inbox, InboxItem } from "./inbox.js";
+import { renderTemplate } from "../shared/template.js";
 
 export type ListenerEvent = "created" | "modified";
 export type ListenerState = "active" | "paused";
@@ -269,16 +270,7 @@ export class ListenerService extends EventEmitter {
   }
 
   private render(listener: Listener, event: ListenerEvent, path: string): unknown {
-    const vars: Record<string, string> = { path, name: posix.basename(path), event, listenerId: listener.id };
     if (listener.payloadTemplate === null) return { event, path, listenerId: listener.id };
-    const walk = (v: unknown): unknown =>
-      typeof v === "string"
-        ? v.replace(/\{\{(\w+)\}\}/g, (m, k: string) => vars[k] ?? m)
-        : Array.isArray(v)
-          ? v.map(walk)
-          : v && typeof v === "object"
-            ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x)]))
-            : v;
-    return walk(listener.payloadTemplate);
+    return renderTemplate(listener.payloadTemplate, { path, name: posix.basename(path), event, listenerId: listener.id });
   }
 }

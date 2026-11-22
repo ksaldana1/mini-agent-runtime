@@ -7,6 +7,7 @@
     "demo:inbox": "tsx src/demos/inbox.ts",
     "demo:fs": "tsx src/demos/filesystem.ts",
     "demo:listeners": "tsx src/demos/listeners.ts",
+    "demo:workflows": "tsx src/demos/workflows.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },

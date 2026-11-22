@@ -1,7 +1,7 @@
 # mini-agent-runtime
 
 A toy local agent platform where agents behave like OS processes / Erlang actors.
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full brief. **Status: Milestone 4 (listeners).**
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full brief. **Status: Milestone 5 (durable workflows). All five milestones from the brief are implemented.**
 
 ## Run
 
@@ -11,6 +11,7 @@ npm run demo:lifecycle   # M1: create Agent A, start / task / stop / restart / c
 npm run demo:inbox       # M2: offline delivery, dedupe, crash redelivery, retries
 npm run demo:fs          # M3: private dirs, closed shared area, sharing one file, audit log
 npm run demo:listeners   # M4: files trigger tasks while the agent (or platform) is offline
+npm run demo:workflows   # M5: a workflow survives a crash, a platform restart, and a failing agent
 npm test                 # vitest
 npm run typecheck
 ```
@@ -29,6 +30,7 @@ reloads Agent A from `data/platform.db` and continues its incarnation count.
  │ Supervisor ───── runtimes table    (incarnation history)
  │ AgentFilesystem ─ fs_grants, fs_audit (checks every file op)
  │ ListenerService ─ listeners, listener_files (periodic scan → inbox)
+ │ WorkflowService ─ workflows, workflow_steps, workflow_events (steps → inbox)
  │     │  agentId → live ChildProcess (at most one)
  └─────┼─────────────────────────────────────────────────┘
        │ fork() + IPC, Zod-validated messages (both directions)
@@ -46,6 +48,8 @@ reloads Agent A from `data/platform.db` and continues its incarnation count.
 | `src/platform/dispatcher.ts` | Push delivery. Hands the oldest pending item to a running, idle runtime; releases claims when a runtime exits. |
 | `src/platform/filesystem.ts` | Platform-checked file access: path normalization, ownership + grants, audit log, atomic writes. |
 | `src/platform/listeners.ts` | Persistent subscriptions. Periodically scans watched directories against a saved snapshot and enqueues inbox items for new or changed files. |
+| `src/platform/workflows.ts` | Durable sequential workflows. Each step is an inbox item; progress comes from the item's stored status. Reassigns failed steps to fallback agents. |
+| `src/shared/template.ts` | `{{dotted.path}}` filling for listener and workflow payloads. |
 | `src/runtime/agent.ts` | The child process. Starts anonymous, learns who it is from `INIT`, handles `TASK` / `PING` / `SHUTDOWN`, and sends `FS_REQUEST` to the platform for any file access. |
 
 ### Agent vs runtime
@@ -135,6 +139,25 @@ filesystem ──scan──▶ ListenerService ──inbox.send──▶ Inbox �
 - **Permissions.** A listener reveals file names and contents to its target, so registering one requires the target agent to have read access to the directory. Access is checked again on every scan: if the grant is revoked, or the agent is deleted or the listener paused, it stops firing and records `lastError`. A paused listener catches up on resume, because the snapshot wasn't advanced while it was paused.
 - **Payload templates.** `{{path}}`, `{{name}}`, `{{event}}`, and `{{listenerId}}` in string values are filled in, so a listener can enqueue a ready-to-run task (for example, `{ action: "transform", from: "{{path}}", to: "~/processed/{{name}}" }`).
 
+### Workflows
+
+A workflow is a named list of steps. Each step names candidate agents (the first one, then
+fallbacks) and a payload template that can use `{{input.*}}`, `{{steps.<name>.*}}` (an earlier
+step's result), and `{{workflow.id}}`.
+
+```text
+WorkflowService ──inbox.send──▶ Inbox ──Dispatcher──▶ runtime
+      ▲                                    │
+      └──── "completed" / "failed" / "released" events
+      └──── reconcileAll() at startup (recovery)
+```
+
+- **Workflows sit on top of the inbox.** A workflow never talks to a runtime. Assigning a step means `inbox.send` with the idempotency key `workflow:<id>:step:<n>:assignment:<k>`. Delivery, crash redelivery, and retry limits all come from the inbox and dispatcher.
+- **Progress comes from stored state.** `reconcile()` looks at the current step's inbox item. If it's `completed`, the result is saved and the next step is assigned (or the workflow completes). If it's `failed`, the step goes to the next candidate agent (or the workflow fails). If it's pending or claimed, nothing happens. Because it only reads the database, calling it repeatedly is safe, and each transition runs in one transaction.
+- **Events for speed, a startup pass for recovery.** Dispatcher events trigger `reconcile` immediately. On startup, `reconcileAll()` catches anything that finished while no service was listening.
+- **Two levels of retry:** retrying *the same agent* (crash or error, up to `maxAttempts`) is the inbox's job. Moving work *to a different agent* is the workflow's job.
+- **Workflow state stays separate from agent state.** Agents don't know they are part of a workflow; they just get tasks. All progress lives in `workflows`, `workflow_steps`, and `workflow_events` (an append-only list of transitions).
+
 ## Trade-offs and limitations
 
 - **Not a sandbox.** `fork()` gives a separate process, not a security boundary. Runtimes are trusted code.
@@ -148,5 +171,8 @@ filesystem ──scan──▶ ListenerService ──inbox.send──▶ Inbox �
 - **Text files only** (UTF-8 strings over IPC), with no size limits.
 - **Listeners are registered by the platform only.** Agents can't create their own listeners over IPC yet.
 - **Listeners only watch files.** No timers or schedules, no agent-to-agent events, and deletes aren't reported. Change detection uses mtime + size, so a rewrite that keeps both the same is missed.
+- **Workflows are sequential only.** No branching, parallel steps, timers, or cancellation.
+- **Steps have no deadline.** A step assigned to an agent that never starts waits forever, because reassignment only happens after a `failed` item. A per-step timeout that triggers reassignment is the obvious next addition.
+- **Step outputs are whatever the agent returns.** There's no schema; a template that refers to a missing field is left unfilled.
 - **Scans cost O(files) each pass,** which is fine for a toy and expensive for big trees. `fs.watch` could later serve as a "scan now" hint on top of the snapshot model.
 - **Runtimes run via `tsx`** (`--import tsx`) to keep dev simple; no build step.

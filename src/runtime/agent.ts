@@ -49,7 +49,9 @@ function platformFs(request: FsRequest): Promise<unknown> {
  * Actions:
  *   (none)      uppercase `text`. Knobs: `delayMs` (slow work), `fail` (throw).
  *   "fs"        forward `request` to the platform filesystem, return its result.
- *   "transform" read `from`, uppercase it, write it to `to`.
+ *   "transform" read `from`, uppercase it, append `suffix`, write it to `to`.
+ *
+ * `delayMs` (simulate slow work) applies to every action.
  */
 async function executeTask(payload: unknown): Promise<unknown> {
   const p = (typeof payload === "object" && payload !== null ? payload : {}) as {
@@ -57,16 +59,17 @@ async function executeTask(payload: unknown): Promise<unknown> {
     request?: FsRequest;
     from?: string;
     to?: string;
+    suffix?: string;
     text?: unknown;
     delayMs?: unknown;
     fail?: unknown;
   };
+  if (typeof p.delayMs === "number") await new Promise((r) => setTimeout(r, p.delayMs as number));
   if (p.action === "fs") return platformFs(p.request!);
   if (p.action === "transform") {
     const input = (await platformFs({ op: "read", path: p.from! })) as string;
-    return platformFs({ op: "write", path: p.to!, content: input.toUpperCase() });
+    return platformFs({ op: "write", path: p.to!, content: input.toUpperCase() + (p.suffix ?? "") });
   }
-  if (typeof p.delayMs === "number") await new Promise((r) => setTimeout(r, p.delayMs as number));
   if (p.fail) throw new Error("task asked to fail");
   return { output: String(p.text ?? "").toUpperCase(), handledBy: identity!.agentId, pid: process.pid };
 }
