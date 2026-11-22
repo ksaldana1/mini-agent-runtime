@@ -10,6 +10,7 @@ import { AgentRegistry, type Agent } from "../src/platform/identity.js";
 import { Inbox } from "../src/platform/inbox.js";
 import { ListenerService } from "../src/platform/listeners.js";
 import { Supervisor } from "../src/platform/supervisor.js";
+import toy from "../src/agents/toy.js";
 
 const DIR = "shared/documents/in";
 
@@ -123,10 +124,10 @@ describe("ListenerService (scan-based, no runtimes)", () => {
   });
 
   it("renders the payload template", () => {
-    listeners.register(agent.id, DIR, { payloadTemplate: { action: "transform", from: "{{path}}", to: "~/out/{{name}}", tags: ["{{event}}"] } });
+    listeners.register(agent.id, DIR, { payloadTemplate: { task: "transform", input: { from: "{{path}}", to: "~/out/{{name}}", tags: ["{{event}}"] } } });
     write("r.txt");
     listeners.scanAll();
-    expect(items()[0]!.payload).toEqual({ action: "transform", from: `${DIR}/r.txt`, to: "~/out/r.txt", tags: ["created"] });
+    expect(items()[0]!.payload).toEqual({ task: "transform", input: { from: `${DIR}/r.txt`, to: "~/out/r.txt", tags: ["created"] } });
   });
 
   it("registrations and snapshots survive a platform restart; offline changes are caught", () => {
@@ -189,14 +190,14 @@ describe("Listener → inbox → runtime, end to end", () => {
     const registry = new AgentRegistry(db);
     const fs = new AgentFilesystem(db, registry, root);
     const inbox = new Inbox(db, registry);
-    supervisor = new Supervisor(db, registry, { fsHandler: (id, req) => fs.handle(id, req) });
+    supervisor = new Supervisor(db, registry, { defaultModule: toy.moduleUrl, fsHandler: (id, req) => fs.handle(id, req) });
     const dispatcher = new Dispatcher(supervisor, inbox);
     const listeners = new ListenerService(db, registry, fs, inbox, { settleMs: 0 });
     const agent = registry.create("indexer");
 
     mkdirSync(join(root, DIR), { recursive: true });
     fs.grant(agent.id, DIR, "read");
-    listeners.register(agent.id, DIR, { payloadTemplate: { action: "transform", from: "{{path}}", to: "~/{{name}}" } });
+    listeners.register(agent.id, DIR, { payloadTemplate: { task: "transform", input: { from: "{{path}}", to: "~/{{name}}" } } });
 
     writeFileSync(join(root, DIR, "doc.txt"), "hello");
     listeners.scanAll();

@@ -28,6 +28,12 @@ export const FsRequestSchema = z.discriminatedUnion("op", [
 ]);
 export type FsRequest = z.infer<typeof FsRequestSchema>;
 
+// ── Inbox payloads ─────────────────────────────────────────────────────────
+// What gets stored in the inbox and turned into a TASK on delivery.
+
+export const TaskPayloadSchema = z.object({ task: z.string().min(1), input: z.unknown() });
+export type TaskPayload = z.infer<typeof TaskPayloadSchema>;
+
 // ── Platform → Runtime ─────────────────────────────────────────────────────
 
 export const AgentMessageSchema = z.discriminatedUnion("type", [
@@ -48,11 +54,18 @@ export const AgentMessageSchema = z.discriminatedUnion("type", [
     name: z.string(),
     incarnation: z.number().int().positive(),
     configuration: z.record(z.string(), z.unknown()),
+    /** file: URL of the agent module; its default export is the agent definition. */
+    module: z.string(),
   }),
   z.object({
     type: z.literal("TASK"),
+    /** Inbox item id: stable across redeliveries. */
     taskId: z.string(),
-    payload: z.unknown(),
+    /** Name of the task in the agent definition. */
+    task: z.string(),
+    input: z.unknown(),
+    /** Delivery attempt, starting at 1. */
+    attempt: z.number().int().positive(),
   }),
   z.object({
     type: z.literal("PING"),
@@ -82,7 +95,7 @@ export const AgentResponseSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("TASK_COMPLETED"),
     taskId: z.string(),
-    result: z.unknown(),
+    result: z.unknown().optional(), // absent when the handler returned undefined (IPC drops it)
   }),
   z.object({
     type: z.literal("PONG"),

@@ -6,6 +6,7 @@ import { openDatabase, type Db } from "../src/platform/database.js";
 import { AgentFilesystem } from "../src/platform/filesystem.js";
 import { AgentRegistry, type Agent } from "../src/platform/identity.js";
 import { Supervisor } from "../src/platform/supervisor.js";
+import probe from "./fixtures/agents/probe.js";
 
 describe("AgentFilesystem (platform-checked permissions)", () => {
   let root: string;
@@ -118,7 +119,7 @@ describe("AgentFilesystem (platform-checked permissions)", () => {
   });
 });
 
-describe("Filesystem over IPC", () => {
+describe("ctx.fs: filesystem over IPC", () => {
   let root: string;
   let db: Db;
   let supervisor: Supervisor;
@@ -126,14 +127,16 @@ describe("Filesystem over IPC", () => {
   let alice: Agent;
   let bob: Agent;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     root = mkdtempSync(join(tmpdir(), "agentfs-ipc-"));
     db = openDatabase(":memory:");
     const registry = new AgentRegistry(db);
     fs = new AgentFilesystem(db, registry, root);
-    supervisor = new Supervisor(db, registry, { fsHandler: (id, req) => fs.handle(id, req) });
+    supervisor = new Supervisor(db, registry, { defaultModule: probe.moduleUrl, fsHandler: (id, req) => fs.handle(id, req) });
     alice = registry.create("alice");
     bob = registry.create("bob");
+    await supervisor.start(alice.id);
+    await supervisor.start(bob.id);
   });
   afterEach(async () => {
     await supervisor.stopAll();
@@ -141,18 +144,48 @@ describe("Filesystem over IPC", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  it("a runtime's requests are authorized as the agent bound to its IPC channel", async () => {
-    await supervisor.start(alice.id);
-    await supervisor.start(bob.id);
+  const as = (agent: Agent, task: string, input: unknown) => supervisor.sendTask(agent.id, task, input);
+
+  it("write / read / list in the agent's own directory", async () => {
+    expect(await as(alice, "write", { path: "~/notes/a.txt", content: "hello" })).toEqual({ path: `agents/${alice.id}/notes/a.txt`, bytes: 5 });
+    expect(await as(alice, "read", { path: "~/notes/a.txt" })).toBe("hello");
+    expect(await as(alice, "list", { path: "~/notes" })).toEqual(["a.txt"]);
+  });
+
+  it("requests are authorized as the agent bound to the IPC channel", async () => {
     writeFileSync(join(root, "shared/documents/in.txt"), "hello");
     fs.grant(alice.id, "shared/documents/in.txt", "read");
-
-    await supervisor.sendTask(alice.id, { action: "transform", from: "shared/documents/in.txt", to: "~/out.txt" });
-    expect(fs.handle(alice.id, { op: "read", path: "~/out.txt" })).toBe("HELLO");
-
+    expect(await as(alice, "read", { path: "shared/documents/in.txt" })).toBe("hello");
     // Same request from bob's runtime is evaluated as bob.
-    await expect(
-      supervisor.sendTask(bob.id, { action: "transform", from: "shared/documents/in.txt", to: "~/out.txt" }),
-    ).rejects.toThrow(/EACCES/);
+    await expect(as(bob, "read", { path: "shared/documents/in.txt" })).rejects.toThrow(/EACCES/);
+  });
+
+  it("share and revoke a file the agent owns", async () => {
+    await as(alice, "write", { path: "~/report.txt", content: "numbers" });
+    const report = `agents/${alice.id}/report.txt`;
+    await expect(as(bob, "read", { path: report })).rejects.toThrow(/EACCES/);
+
+    await as(alice, "share", { path: "~/report.txt", agentId: bob.id, access: "read" });
+    expect(await as(bob, "read", { path: report })).toBe("numbers");
+    await expect(as(bob, "write", { path: report, content: "x" })).rejects.toThrow(/EACCES/);
+
+    await as(alice, "revoke", { path: "~/report.txt", agentId: bob.id });
+    await expect(as(bob, "read", { path: report })).rejects.toThrow(/EACCES/);
+  });
+
+  it("a denial is an FsDeniedError inside the handler, and non-retryable outside it", async () => {
+    expect(await as(bob, "tryRead", { path: `agents/${alice.id}/x` })).toMatchObject({
+      ok: false,
+      denied: true,
+      retryable: false,
+      message: expect.stringMatching(/^EACCES: read/),
+    });
+    await expect(as(bob, "read", { path: `agents/${alice.id}/x` })).rejects.toMatchObject({ retryable: false });
+  });
+
+  it("only the owner can share", async () => {
+    await expect(as(bob, "share", { path: `agents/${alice.id}/x`, agentId: bob.id, access: "read" })).rejects.toThrow(
+      /only the owner can share/,
+    );
   });
 });

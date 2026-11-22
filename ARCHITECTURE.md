@@ -561,6 +561,10 @@ All five milestones are implemented (see README). This section records what the 
 - The symlink check happens before the file operation, so a symlink created in between could slip through (a time-of-check/time-of-use race).
 - Sender identity is validated, but nothing restricts which agents may send to which.
 
+**Agent code**
+- Agent modules are imported by both the platform and every runtime, so they must be side-effect free at the top level. Nothing enforces this.
+- A listener's default payload (`{ event, path, listenerId }`) isn't a task, so it fails permanently if delivered. Listeners need a `{ task, input }` template until Phase 3 of the library plan adds code-defined targets.
+
 **Lifecycle**
 - Restart policies live in memory and must be set again on every boot. Crash counts for the restart window are not persisted either.
 - Stopping an agent doesn't wait for its in-flight task. The task is redelivered, and that delivery counts as an attempt.
@@ -590,7 +594,7 @@ All five milestones are implemented (see README). This section records what the 
 
 ### Next Steps
 
-1. **Library API.** In progress; see [LIBRARY_PLAN.md](LIBRARY_PLAN.md). Phase 0 (migrations, settlement events, permanent errors, explicit recovery, restart policies) is done.
+1. **Library API.** In progress; see [LIBRARY_PLAN.md](LIBRARY_PLAN.md). Phase 0 (migrations, settlement events, permanent errors, explicit recovery, restart policies) and Phase 1 (`defineAgent`, the generic runtime host, `AgentContext`) are done.
 2. **Step deadlines.** Give each workflow step a timeout that triggers reassignment to the next candidate agent, so a step held by an agent that never runs doesn't block the workflow.
 3. **Agent-initiated messaging and listeners.** Add IPC messages that let runtimes send inbox messages and register listeners, with a check on who may send to whom.
 4. **OS-enforced isolation.** Give each agent its own Unix user (or namespace/container), and turn platform grants into real file ownership, POSIX permissions, or ACLs, so the kernel enforces access instead of TypeScript.

@@ -66,8 +66,13 @@ interface Runtime extends RuntimeInfo {
 }
 
 export interface SupervisorOptions {
-  /** Script forked for each runtime. Defaults to src/runtime/agent.ts. */
+  /** Script forked for each runtime. Defaults to the generic host, src/runtime/host.ts. */
   runtimeEntry?: string;
+  /**
+   * Agent module (file: URL) for agents with none set via setModule(). Handy for kernel
+   * tests and demos where every agent runs the same code; the library sets one per agent.
+   */
+  defaultModule?: string;
   requestTimeoutMs?: number;
   stopTimeoutMs?: number;
   /** Forward runtime stdout/stderr to ours (handy in the demo, noisy in tests). */
@@ -89,7 +94,7 @@ export class TaskError extends Error {
   }
 }
 
-const DEFAULT_ENTRY = fileURLToPath(new URL("../runtime/agent.ts", import.meta.url));
+const DEFAULT_ENTRY = fileURLToPath(new URL("../runtime/host.ts", import.meta.url));
 
 /**
  * The authority on runtime lifecycle. Maps persistent agent IDs to the
@@ -109,6 +114,8 @@ export class Supervisor extends EventEmitter {
   private readonly inheritStdio: boolean;
   private readonly fsHandler: SupervisorOptions["fsHandler"];
   private readonly supervision = new Map<string, Supervision>();
+  private readonly modules = new Map<string, string>();
+  private readonly defaultModule: string | undefined;
   private closed = false;
 
   constructor(
@@ -122,6 +129,7 @@ export class Supervisor extends EventEmitter {
     this.stopTimeoutMs = opts.stopTimeoutMs ?? 2_000;
     this.inheritStdio = opts.inheritStdio ?? false;
     this.fsHandler = opts.fsHandler;
+    this.defaultModule = opts.defaultModule;
   }
 
   /**
@@ -151,6 +159,14 @@ export class Supervisor extends EventEmitter {
 
   // ── Lifecycle ────────────────────────────────────────────────────────────
 
+  /**
+   * Which agent module this agent's runtimes load (a file: URL). Behaviour lives in code
+   * and is supplied on every boot; the database only knows the agent's identity (D3).
+   */
+  setModule(agentId: string, moduleUrl: string): void {
+    this.modules.set(agentId, moduleUrl);
+  }
+
   /** Set (or replace) the restart policy for an agent. In memory: code supplies it every boot. */
   setPolicy(agentId: string, policy: RestartPolicy): void {
     const existing = this.supervision.get(agentId);
@@ -177,6 +193,8 @@ export class Supervisor extends EventEmitter {
     if (!agent) throw new Error(`unknown agent ${agentId}`);
     if (agent.lifecycleState !== "active") throw new Error(`agent ${agentId} is ${agent.lifecycleState}`);
     if (this.isLive(agentId)) throw new Error(`agent ${agentId} already has a live runtime`);
+    const module = this.modules.get(agentId) ?? this.defaultModule;
+    if (!module) throw new Error(`agent ${agent.name} (${agentId}) has no agent definition registered in this process`);
 
     const incarnation = this.nextIncarnation(agentId);
     const child = fork(this.entry, [], {
@@ -232,7 +250,12 @@ export class Supervisor extends EventEmitter {
       name: agent.name,
       incarnation,
       configuration: agent.configuration,
+      module,
     });
+    if (ready.type === "ERROR") {
+      child.kill("SIGKILL");
+      throw new Error(`agent ${agent.name} failed to start: ${ready.message}`);
+    }
     if (ready.type !== "READY" || ready.agentId !== agentId) {
       child.kill("SIGKILL");
       throw new Error(`runtime handshake failed: ${JSON.stringify(ready)}`);
@@ -342,8 +365,18 @@ export class Supervisor extends EventEmitter {
     return res;
   }
 
-  async sendTask(agentId: string, payload: unknown, taskId: string = randomUUID()): Promise<unknown> {
-    const res = await this.request(this.running(agentId), taskId, { type: "TASK", taskId, payload });
+  /**
+   * Direct RPC: run one task on the live runtime, no inbox. Internal (the dispatcher's
+   * transport); the public sending path is the durable inbox (D6).
+   */
+  async sendTask(
+    agentId: string,
+    task: string,
+    input: unknown,
+    opts: { taskId?: string; attempt?: number } = {},
+  ): Promise<unknown> {
+    const taskId = opts.taskId ?? randomUUID();
+    const res = await this.request(this.running(agentId), taskId, { type: "TASK", taskId, task, input, attempt: opts.attempt ?? 1 });
     if (res.type === "ERROR") throw new TaskError(`task ${taskId} failed: ${res.message}`, res.retryable ?? true);
     if (res.type !== "TASK_COMPLETED") throw new Error(`expected TASK_COMPLETED, got ${res.type}`);
     return res.result;

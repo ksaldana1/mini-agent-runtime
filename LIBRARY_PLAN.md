@@ -1,7 +1,7 @@
 # Library-ification Plan
 
-> **Status (2026-11-22):** plan and all design decisions (D1–D8) approved. **Phase 0 done, awaiting review.**
-> Next: **Phase 1**. Read [Handoff notes](#handoff-notes-for-a-fresh-session) first.
+> **Status (2026-11-22):** plan and all design decisions (D1–D8) approved. **Phases 0–1 done; Phase 1 awaiting review.**
+> Next: **Phase 2**. Read [Handoff notes](#handoff-notes-for-a-fresh-session) first.
 
 Turn the platform from "seven classes you wire by hand" into a small library with a typed,
 awaitable API. The current classes in `src/platform/` stay as the internal **kernel**. The new
@@ -106,22 +106,22 @@ These are internal changes that the later phases depend on. Every existing test 
 
 ## Phase 1: `defineAgent` and the generic runtime host
 
-### ☐ 1.1 Agent definition types · S
+### ☑ 1.1 Agent definition types · S
 - `src/lib/agent.ts`: `defineAgent(moduleUrl, { tasks })`, with `TaskDef<In, Out> = { input: ZodType<In>; run(input: In, ctx: AgentContext): Promise<Out> | Out }`.
 - Exported helper types: `TaskNames<D>`, `TaskInput<D, K>`, `TaskOutput<D, K>`.
 - **Done when:** type-level tests (`expectTypeOf`) show that input and output types are inferred from the definition.
 
-### ☐ 1.2 Runtime host · M
+### ☑ 1.2 Runtime host · M
 - New entry point `src/runtime/host.ts` replaces `agent.ts`. `INIT` gains `module` (a file URL). The host dynamically imports the module, checks that its default export is an agent definition, and replies `READY` (or an `ERROR` that the supervisor reports as a failed start).
 - On `TASK`: look up the task by name. An unknown name is a non-retryable error. Then validate `input` with the task's Zod schema (failure is non-retryable), run the handler with `ctx`, and reply with the result.
 - **Done when:** there are tests for a happy path, an unknown task, invalid input, a handler that throws, and a module with a bad default export.
 
-### ☐ 1.3 `AgentContext` · S
+### ☑ 1.3 `AgentContext` · S
 - `ctx.agent` (`{ id, name, incarnation }`), `ctx.taskId` (to use as an idempotency key), `ctx.attempt`, and `ctx.log`.
 - `ctx.fs`: `read`, `write`, `list`, `share(path, agentId, access)`, and `revoke`. These are typed wrappers around `FS_REQUEST`, which throw `FsDeniedError` with `retryable: false`.
 - **Done when:** the filesystem-over-IPC tests are rewritten against `ctx.fs`.
 
-### ☐ 1.4 Port the toy agent; migrate payloads · M
+### ☑ 1.4 Port the toy agent; migrate payloads · M
 - `src/agents/toy.ts` reimplements `uppercase`, `transform`, and `fs` as tasks, so the supervisor no longer has a hard-coded default.
 - Mechanically migrate every demo and test payload from `{ action, ... }` to `{ task, input }`, including listener templates and workflow step payloads.
 - **Done when:** all 63+ tests and all six demos pass with the old `agent.ts` deleted.
@@ -245,11 +245,17 @@ Read these before touching code.
 **Read first:** this file, then `ARCHITECTURE.md` (the original brief, plus §10 for known limitations), then `README.md` (how each subsystem works and why). The kernel code is in `src/platform/`. The best end-to-end example is `src/demos/newsroom.ts`.
 
 **Where things stand:**
-- Milestones 1–5 from `ARCHITECTURE.md` are complete, and so is Phase 0: 87 tests passing, `tsc` clean, six demos working (`npm run demo:newsroom` plus one per milestone).
+- Milestones 1–5 from `ARCHITECTURE.md` are complete, and so is Phases 0–1: 106 tests passing, `tsc` clean, six demos working (`npm run demo:newsroom` plus one per milestone).
 - Phase 0 notes for later phases:
   - Supervisor events added: `restart-scheduled`, `gave-up`, `restart-failed`. Phase 2.4's `agent.gave-up` maps to `gave-up`.
   - `TaskError` (in `supervisor.ts`) carries `retryable`. The runtime marks `EACCES` (the `code` field on `FS_RESPONSE`) and invalid toy payloads as permanent. Phase 1.2's host should do the same for unknown tasks and Zod input failures.
   - `dispatcher.recover()` throws if anything is already in flight, so `platform.start()` must call it before starting agents.
+- Phase 1 notes for later phases:
+  - The kernel learns an agent's code through `supervisor.setModule(agentId, def.moduleUrl)`. There's also a `defaultModule` option, used by kernel tests and demos. `platform.agent()` should call `setModule`.
+  - `defineAgent` infers through **two** homomorphic mapped types (one for schemas, one for outputs). A single mapped type infers the outputs as `unknown`, and an assignment-based type test won't notice. Use `expectTypeOf(...).toEqualTypeOf` (which `npm run typecheck` enforces) when touching these types again. The same trick is likely needed for the workflow builder in 3.1.
+  - `TaskInput` is the schema's *input* type (defaults optional), which is what `send()` should accept in 2.3. The parent can validate with the same schema before enqueueing.
+  - The toy agent's `fs` task uses `share` / `revoke` with `agentId`, matching `ctx.fs`; the old `grant` / `granteeAgentId` shape is gone.
+  - A listener's default payload is not a task (see ARCHITECTURE §10). Phase 3.4 removes the problem.
 - Work is committed on `main`; commit at the end of each phase so every phase has a clean diff.
 
 **Environment quirks (macOS, not Linux):**

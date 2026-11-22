@@ -14,12 +14,13 @@ import { AgentRegistry } from "../platform/identity.js";
 import { Inbox } from "../platform/inbox.js";
 import { ListenerService } from "../platform/listeners.js";
 import { Supervisor } from "../platform/supervisor.js";
+import toy from "../agents/toy.js";
 
 const db = openDatabase("data/platform.db");
 const registry = new AgentRegistry(db);
 const fs = new AgentFilesystem(db, registry, "data");
 const inbox = new Inbox(db, registry);
-const supervisor = new Supervisor(db, registry, { fsHandler: (id, req) => fs.handle(id, req) });
+const supervisor = new Supervisor(db, registry, { defaultModule: toy.moduleUrl, fsHandler: (id, req) => fs.handle(id, req) });
 const dispatcher = new Dispatcher(supervisor, inbox);
 supervisor.recover();
 dispatcher.recover();
@@ -62,7 +63,7 @@ try {
   step(1, `Grant the agent read on ${watched} and register a listener`);
   fs.grant(agent.id, watched, "read");
   const listener = listeners.register(agent.id, watched, {
-    payloadTemplate: { action: "transform", from: "{{path}}", to: "~/processed/{{name}}" },
+    payloadTemplate: { task: "transform", input: { from: "{{path}}", to: "~/processed/{{name}}" } },
   });
   listeners.start();
   console.log(`   listener ${listener.id.slice(0, 8)}; agent runtime: ${supervisor.status(agent.id)?.state ?? "none"}`);

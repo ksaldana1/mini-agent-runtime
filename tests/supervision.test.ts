@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openDatabase, type Db } from "../src/platform/database.js";
 import { AgentRegistry, type Agent } from "../src/platform/identity.js";
 import { Supervisor } from "../src/platform/supervisor.js";
+import toy from "../src/agents/toy.js";
 
 async function until(cond: () => boolean, timeoutMs = 5_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -25,7 +26,7 @@ describe("Supervisor restart policy", () => {
   beforeEach(() => {
     db = openDatabase(":memory:");
     registry = new AgentRegistry(db);
-    supervisor = new Supervisor(db, registry);
+    supervisor = new Supervisor(db, registry, { defaultModule: toy.moduleUrl });
     agent = registry.create("agent-a");
     dir = mkdtempSync(join(tmpdir(), "supervision-"));
   });
@@ -67,7 +68,7 @@ describe("Supervisor restart policy", () => {
     // A runtime that dies before the handshake: every start crashes.
     const entry = join(dir, "crash.mjs");
     writeFileSync(entry, "process.exit(1);\n");
-    const crashy = new Supervisor(db, registry, { runtimeEntry: entry });
+    const crashy = new Supervisor(db, registry, { defaultModule: toy.moduleUrl, runtimeEntry: entry });
     crashy.setPolicy(agent.id, { restart: "on-crash", maxRestarts: 3, backoffMs: 20 });
 
     const delays: number[] = [];

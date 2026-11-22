@@ -11,6 +11,7 @@ import { Inbox } from "../src/platform/inbox.js";
 import { Supervisor } from "../src/platform/supervisor.js";
 import { WorkflowService, type WorkflowDefinition } from "../src/platform/workflows.js";
 import { renderTemplate } from "../src/shared/template.js";
+import toy from "../src/agents/toy.js";
 
 describe("renderTemplate", () => {
   it("fills dotted placeholders, keeping raw values for whole-string placeholders", () => {
@@ -42,8 +43,8 @@ describe("WorkflowService (state machine over the inbox)", () => {
   const def = (): WorkflowDefinition => ({
     name: "two-step",
     steps: [
-      { name: "first", agents: [a.id], payload: { text: "{{input.text}}" } },
-      { name: "second", agents: [b.id, c.id], payload: { from: "{{steps.first.out}}", wf: "{{workflow.id}}" } },
+      { name: "first", agents: [a.id], payload: { task: "uppercase", input: { text: "{{input.text}}" } } },
+      { name: "second", agents: [b.id, c.id], payload: { task: "transform", input: { from: "{{steps.first.out}}", wf: "{{workflow.id}}" } } },
     ],
   });
 
@@ -65,7 +66,7 @@ describe("WorkflowService (state machine over the inbox)", () => {
     db = openDatabase(":memory:");
     registry = new AgentRegistry(db);
     inbox = new Inbox(db, registry);
-    supervisor = new Supervisor(db, registry);
+    supervisor = new Supervisor(db, registry, { defaultModule: toy.moduleUrl });
     dispatcher = new Dispatcher(supervisor, inbox);
     workflows = new WorkflowService(db, registry, inbox);
     a = registry.create("a");
@@ -87,7 +88,7 @@ describe("WorkflowService (state machine over the inbox)", () => {
     const wf = workflows.start(def(), { text: "hi" });
     expect(wf).toMatchObject({ status: "running", currentStep: 0 });
     const [item] = inbox.list(a.id);
-    expect(item).toMatchObject({ payload: { text: "hi" }, idempotencyKey: `workflow:${wf.id}:step:0:assignment:1` });
+    expect(item).toMatchObject({ payload: { task: "uppercase", input: { text: "hi" } }, idempotencyKey: `workflow:${wf.id}:step:0:assignment:1` });
     expect(workflows.steps(wf.id)[0]).toMatchObject({ status: "assigned", agentId: a.id, inboxItemId: item!.id });
   });
 
@@ -97,7 +98,7 @@ describe("WorkflowService (state machine over the inbox)", () => {
     workflows.reconcile(wf.id);
 
     expect(workflows.get(wf.id)!.currentStep).toBe(1);
-    expect(inbox.list(b.id)[0]!.payload).toEqual({ from: "a/out.txt", wf: wf.id });
+    expect(inbox.list(b.id)[0]!.payload).toEqual({ task: "transform", input: { from: "a/out.txt", wf: wf.id } });
 
     finish(b, { done: true });
     workflows.reconcile(wf.id);
@@ -211,7 +212,7 @@ describe("Workflows end to end (real runtimes)", () => {
     const registry = new AgentRegistry(db);
     const fs = new AgentFilesystem(db, registry, root);
     const inbox = new Inbox(db, registry);
-    supervisor = new Supervisor(db, registry, { fsHandler: (id, req) => fs.handle(id, req) });
+    supervisor = new Supervisor(db, registry, { defaultModule: toy.moduleUrl, fsHandler: (id, req) => fs.handle(id, req) });
     new Dispatcher(supervisor, inbox);
     const workflows = new WorkflowService(db, registry, inbox);
     const worker = registry.create("worker");
@@ -224,8 +225,8 @@ describe("Workflows end to end (real runtimes)", () => {
     const wf = workflows.start({
       name: "e2e",
       steps: [
-        { name: "copy", agents: [worker.id], payload: { action: "transform", from: "{{input.src}}", to: "~/a.txt", delayMs: 200 } },
-        { name: "again", agents: [worker.id], payload: { action: "transform", from: "{{steps.copy.path}}", to: "~/b.txt", suffix: "!" } },
+        { name: "copy", agents: [worker.id], payload: { task: "transform", input: { from: "{{input.src}}", to: "~/a.txt", delayMs: 200 } } },
+        { name: "again", agents: [worker.id], payload: { task: "transform", input: { from: "{{steps.copy.path}}", to: "~/b.txt", suffix: "!" } } },
       ],
     }, { src: "shared/documents/in.txt" });
 

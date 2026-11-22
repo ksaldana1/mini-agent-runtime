@@ -9,10 +9,11 @@
 import { openDatabase } from "../platform/database.js";
 import { AgentRegistry } from "../platform/identity.js";
 import { Supervisor } from "../platform/supervisor.js";
+import toy from "../agents/toy.js";
 
 const db = openDatabase("data/platform.db");
 const registry = new AgentRegistry(db);
-const supervisor = new Supervisor(db, registry, { inheritStdio: true });
+const supervisor = new Supervisor(db, registry, { defaultModule: toy.moduleUrl, inheritStdio: true });
 supervisor.recover(); // close out runtime records left open by a previous run
 
 supervisor.on("runtime-exit", (r) =>
@@ -31,7 +32,7 @@ try {
   console.log(`   runtime: incarnation #${first.incarnation}, pid ${first.pid}`);
 
   step(3, "Send a structured TASK message");
-  const result = await supervisor.sendTask(agent.id, { text: "hello from the platform" });
+  const result = await supervisor.sendTask(agent.id, "uppercase", { text: "hello from the platform" });
   console.log(`   result:`, result);
 
   step(4, "Terminate the runtime");

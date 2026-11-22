@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openDatabase, type Db } from "../src/platform/database.js";
 import { AgentRegistry, type Agent } from "../src/platform/identity.js";
 import { Supervisor, type RuntimeInfo } from "../src/platform/supervisor.js";
+import toy from "../src/agents/toy.js";
 
 describe("Supervisor + runtime processes", () => {
   let db: Db;
@@ -12,7 +13,7 @@ describe("Supervisor + runtime processes", () => {
   beforeEach(() => {
     db = openDatabase(":memory:");
     registry = new AgentRegistry(db);
-    supervisor = new Supervisor(db, registry);
+    supervisor = new Supervisor(db, registry, { defaultModule: toy.moduleUrl });
     agent = registry.create("agent-a");
   });
 
@@ -32,7 +33,7 @@ describe("Supervisor + runtime processes", () => {
 
   it("round-trips a TASK", async () => {
     await supervisor.start(agent.id);
-    const result = await supervisor.sendTask(agent.id, { text: "hi" });
+    const result = await supervisor.sendTask(agent.id, "uppercase", { text: "hi" });
     expect(result).toMatchObject({ output: "HI", handledBy: agent.id });
   });
 

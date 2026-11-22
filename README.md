@@ -36,7 +36,8 @@ reloads Agent A from `data/platform.db` and continues its incarnation count.
  └─────┼─────────────────────────────────────────────────┘
        │ fork() + IPC, Zod-validated messages (both directions)
        ▼
- runtime process (src/runtime/agent.ts)   pid changes every incarnation
+ runtime process (src/runtime/host.ts)    pid changes every incarnation
+   └─ imports the agent module named in INIT (e.g. src/agents/toy.ts)
 ```
 
 | File | Role |
@@ -51,7 +52,45 @@ reloads Agent A from `data/platform.db` and continues its incarnation count.
 | `src/platform/listeners.ts` | Persistent subscriptions. Periodically scans watched directories against a saved snapshot and enqueues inbox items for new or changed files. |
 | `src/platform/workflows.ts` | Durable sequential workflows. Each step is an inbox item; progress comes from the item's stored status. Reassigns failed steps to fallback agents. |
 | `src/shared/template.ts` | `{{dotted.path}}` filling for listener and workflow payloads. |
-| `src/runtime/agent.ts` | The child process. Starts anonymous, learns who it is from `INIT`, handles `TASK` / `PING` / `SHUTDOWN`, and sends `FS_REQUEST` to the platform for any file access. |
+| `src/runtime/host.ts` | The child process: a generic host. Starts anonymous; `INIT` tells it who it is and which agent module to import. Validates each `TASK`'s input with the named task's schema, runs the handler with a context (`ctx.fs` sends `FS_REQUEST` to the platform), and handles `PING` / `SHUTDOWN`. |
+| `src/lib/agent.ts` | `defineAgent(import.meta.url, { tasks })`: an agent's code. Typed tasks (Zod input schema + `run(input, ctx)`), `AgentContext`, and the `TaskNames` / `TaskInput` / `TaskOutput` helper types. |
+| `src/lib/errors.ts` | `PermanentError` and `FsDeniedError`: errors that fail a task without retries. |
+| `src/agents/toy.ts` | The toy agent the milestone demos use: `uppercase`, `transform`, and `fs` tasks. |
+
+### Agent code: `defineAgent` and the runtime host
+
+What an agent *does* lives in an agent module. The database only knows the agent's identity (D3 in
+[LIBRARY_PLAN.md](LIBRARY_PLAN.md)):
+
+```ts
+// src/agents/toy.ts (abridged)
+export default defineAgent(import.meta.url, {
+  tasks: {
+    transform: {
+      input: z.object({ from: z.string(), to: z.string(), suffix: z.string().default("") }),
+      async run({ from, to, suffix }, ctx) {
+        const text = await ctx.fs.read(from);
+        return ctx.fs.write(to, text.toUpperCase() + suffix);
+      },
+    },
+  },
+});
+```
+
+- **One module, two processes.** The platform imports the module for its types and its URL, and
+  `supervisor.setModule(agentId, def.moduleUrl)` records which module the agent's runtimes load.
+  The runtime host imports the same module. So agent modules must be **side-effect free at the top level**.
+- **Startup.** The host replies `READY` only once the module has loaded and its default export is an
+  agent definition. Otherwise it replies `ERROR`, and `supervisor.start()` rejects with the reason.
+  An agent with no module registered in this process can't be started at all.
+- **Tasks.** The host looks up the task by name, validates the input with the task's Zod schema, and
+  calls `run(input, ctx)`. Unknown task names and invalid input are **non-retryable**, as are
+  `PermanentError` and `FsDeniedError` thrown from a handler. Any other error is retried.
+- **Context.** `ctx.agent` (`id`, `name`, `incarnation`), `ctx.taskId` (stable across redeliveries:
+  use it as an idempotency key), `ctx.attempt`, `ctx.log`, and `ctx.fs` (`read`, `write`, `list`,
+  `share`, `revoke`).
+- **Types.** Each handler's input type comes from its schema, and its output type from its return
+  value. `TaskInput<typeof def, "transform">` and `TaskOutput<typeof def, "transform">` expose them to callers.
 
 ### Agent vs runtime
 
@@ -75,7 +114,9 @@ gives an agent Erlang-style one-for-one supervision. Policies are in memory: cod
 
 The **inbox** (`inbox.ts`) is durable storage that answers "what does this agent owe / is owed?".
 The **dispatcher** (`dispatcher.ts`) is transport: it decides *when* to hand an item to a process.
-Runtimes never touch the inbox. They only see `TASK` messages, with `taskId` set to the inbox item id.
+Runtimes never touch the inbox. Inbox payloads are `{ task, input }`; on delivery the dispatcher turns
+one into a `TASK { taskId, task, input, attempt }` message, with `taskId` set to the inbox item id.
+A payload of any other shape is failed permanently without reaching a runtime.
 
 Delivery is **at-least-once**:
 
@@ -150,7 +191,7 @@ filesystem ──scan──▶ ListenerService ──inbox.send──▶ Inbox �
 - **New files only, by default.** Files present at registration are recorded as already seen. Pass `includeExisting` to process them anyway.
 - **Settling.** Files modified within the last `settleMs` are skipped until a later scan, so a half-written file from an outside writer isn't processed. Files ending in `*.tmp` (the platform's own in-progress writes) are always ignored.
 - **Permissions.** A listener reveals file names and contents to its target, so registering one requires the target agent to have read access to the directory. Access is checked again on every scan: if the grant is revoked, or the agent is deleted or the listener paused, it stops firing and records `lastError`. A paused listener catches up on resume, because the snapshot wasn't advanced while it was paused.
-- **Payload templates.** `{{path}}`, `{{name}}`, `{{event}}`, and `{{listenerId}}` in string values are filled in, so a listener can enqueue a ready-to-run task (for example, `{ action: "transform", from: "{{path}}", to: "~/processed/{{name}}" }`).
+- **Payload templates.** `{{path}}`, `{{name}}`, `{{event}}`, and `{{listenerId}}` in string values are filled in, so a listener can enqueue a ready-to-run task (for example, `{ task: "transform", input: { from: "{{path}}", to: "~/processed/{{name}}" } }`). The default payload, `{ event, path, listenerId }`, is not a task, so a listener that delivers to a real agent needs a template.
 
 ### Workflows
 

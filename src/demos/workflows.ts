@@ -14,6 +14,7 @@ import { AgentRegistry } from "../platform/identity.js";
 import { Inbox } from "../platform/inbox.js";
 import { Supervisor } from "../platform/supervisor.js";
 import { WorkflowService } from "../platform/workflows.js";
+import toy from "../agents/toy.js";
 
 const DB_PATH = "data/platform.db";
 const DATA = "data";
@@ -24,7 +25,7 @@ function boot() {
   const registry = new AgentRegistry(db);
   const fs = new AgentFilesystem(db, registry, DATA);
   const inbox = new Inbox(db, registry);
-  const supervisor = new Supervisor(db, registry, { fsHandler: (id, req) => fs.handle(id, req) });
+  const supervisor = new Supervisor(db, registry, { defaultModule: toy.moduleUrl, fsHandler: (id, req) => fs.handle(id, req) });
   const dispatcher = new Dispatcher(supervisor, inbox);
   const workflows = new WorkflowService(db, registry, inbox);
   workflows.on("transition", (e) => console.log(`   [workflow] ${e.event.padEnd(18)} ${e.detail}`));
@@ -73,12 +74,12 @@ try {
         {
           name: "extract",
           agents: [extractor.id],
-          payload: { action: "transform", from: "{{input.source}}", to: `${artifacts}/extracted.txt`, delayMs: 600 },
+          payload: { task: "transform", input: { from: "{{input.source}}", to: `${artifacts}/extracted.txt`, delayMs: 600 } },
         },
         {
           name: "review",
           agents: [reviewer.id, backup.id],
-          payload: { action: "transform", from: "{{steps.extract.path}}", to: "~/reviewed.txt", suffix: "-- approved\n" },
+          payload: { task: "transform", input: { from: "{{steps.extract.path}}", to: "~/reviewed.txt", suffix: "-- approved\n" } },
         },
       ],
     },

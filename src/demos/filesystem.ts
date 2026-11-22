@@ -10,12 +10,15 @@ import { openDatabase } from "../platform/database.js";
 import { AgentFilesystem } from "../platform/filesystem.js";
 import { AgentRegistry } from "../platform/identity.js";
 import { Supervisor } from "../platform/supervisor.js";
-import type { FsRequest } from "../shared/protocol.js";
+import toy from "../agents/toy.js";
+import type { TaskInput } from "../lib/agent.js";
+
+type ToyFsRequest = TaskInput<typeof toy, "fs">["request"];
 
 const db = openDatabase("data/platform.db");
 const registry = new AgentRegistry(db);
 const fs = new AgentFilesystem(db, registry, "data");
-const supervisor = new Supervisor(db, registry, { fsHandler: (agentId, req) => fs.handle(agentId, req) });
+const supervisor = new Supervisor(db, registry, { defaultModule: toy.moduleUrl, fsHandler: (agentId, req) => fs.handle(agentId, req) });
 supervisor.recover();
 
 const run = Date.now();
@@ -25,17 +28,17 @@ const names: Record<string, string> = { [alice.id]: "alice", [bob.id]: "bob" };
 const short = (p: string) => p.replaceAll(alice.id, "<alice>").replaceAll(bob.id, "<bob>");
 
 /** Ask an agent's runtime to do something; print whether the platform allowed it. */
-async function attempt(agentId: string, what: string, payload: unknown): Promise<void> {
+async function attempt(agentId: string, what: string, [task, input]: [string, unknown]): Promise<void> {
   try {
-    const result = await supervisor.sendTask(agentId, payload);
+    const result = await supervisor.sendTask(agentId, task, input);
     const shown = typeof result === "string" ? JSON.stringify(result) : JSON.stringify(result, (_k, v) => (typeof v === "string" ? short(v) : v));
     console.log(`   ✓ ${names[agentId]}: ${what}\n       → ${shown}`);
   } catch (err) {
-    const msg = short((err as Error).message.replace(/^task \S+ failed: Error: /, ""));
+    const msg = short((err as Error).message.replace(/^task \S+ failed: \w*Error: /, ""));
     console.log(`   ✗ ${names[agentId]}: ${what}\n       → ${msg}`);
   }
 }
-const fsTask = (request: FsRequest) => ({ action: "fs", request });
+const fsTask = (request: ToyFsRequest): [string, unknown] => ["fs", { request }];
 const step = (n: number, text: string) => console.log(`\n${n}. ${text}`);
 
 try {
@@ -55,19 +58,19 @@ try {
 
   step(3, "Platform grants alice read on shared/documents; she produces a report");
   fs.grant(alice.id, "shared/documents", "read");
-  await attempt(alice.id, `transform ${brief} → ~/report.txt`, { action: "transform", from: brief, to: "~/report.txt" });
+  await attempt(alice.id, `transform ${brief} → ~/report.txt`, ["transform", { from: brief, to: "~/report.txt" }]);
   await attempt(alice.id, "write into shared/documents", fsTask({ op: "write", path: "shared/documents/x.txt", content: "x" }));
 
   step(4, "Bob can't see the report until alice shares it");
   await attempt(bob.id, "read alice's report", fsTask({ op: "read", path: report }));
-  await attempt(alice.id, "grant bob read on ~/report.txt", fsTask({ op: "grant", path: "~/report.txt", granteeAgentId: bob.id, access: "read" }));
+  await attempt(alice.id, "grant bob read on ~/report.txt", fsTask({ op: "share", path: "~/report.txt", agentId: bob.id, access: "read" }));
   await attempt(bob.id, "read alice's report", fsTask({ op: "read", path: report }));
 
   step(5, "...and the grant covers exactly that file, read-only");
   await attempt(bob.id, "read alice's notes", fsTask({ op: "read", path: `agents/${alice.id}/notes.txt` }));
   await attempt(bob.id, "list alice's directory", fsTask({ op: "list", path: `agents/${alice.id}` }));
   await attempt(bob.id, "overwrite alice's report", fsTask({ op: "write", path: report, content: "bob was here" }));
-  await attempt(bob.id, "re-share alice's report with himself as write", fsTask({ op: "grant", path: report, granteeAgentId: bob.id, access: "write" }));
+  await attempt(bob.id, "re-share alice's report with himself as write", fsTask({ op: "share", path: report, agentId: bob.id, access: "write" }));
 
   step(6, "Path tricks are normalized or rejected");
   await attempt(bob.id, "read ~/../<alice>/notes.txt", fsTask({ op: "read", path: `~/../${alice.id}/notes.txt` }));
@@ -75,7 +78,7 @@ try {
   await attempt(bob.id, "read /etc/passwd", fsTask({ op: "read", path: "/etc/passwd" }));
 
   step(7, "Alice revokes; bob loses access");
-  await attempt(alice.id, "revoke bob on ~/report.txt", fsTask({ op: "revoke", path: "~/report.txt", granteeAgentId: bob.id }));
+  await attempt(alice.id, "revoke bob on ~/report.txt", fsTask({ op: "revoke", path: "~/report.txt", agentId: bob.id }));
   await attempt(bob.id, "read alice's report", fsTask({ op: "read", path: report }));
 
   step(8, "Audit log (every decision the platform made)");

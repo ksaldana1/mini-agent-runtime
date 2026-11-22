@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import type { Inbox, InboxItem } from "./inbox.js";
 import { TaskError, type Supervisor } from "./supervisor.js";
+import { TaskPayloadSchema } from "../shared/protocol.js";
 
 interface InFlight {
   itemId: string;
@@ -68,8 +69,13 @@ export class Dispatcher extends EventEmitter {
     this.inFlight.set(agentId, slot);
     this.emit("delivered", { item, incarnation: runtime.incarnation });
 
-    this.supervisor
-      .sendTask(agentId, item.payload, item.id)
+    // Inbox payloads are { task, input }. Anything else can never succeed: fail it for good.
+    const payload = TaskPayloadSchema.safeParse(item.payload);
+    const sent = payload.success
+      ? this.supervisor.sendTask(agentId, payload.data.task, payload.data.input, { taskId: item.id, attempt: item.attempts })
+      : Promise.reject(new TaskError(`invalid inbox payload (expected { task, input }): ${JSON.stringify(item.payload)}`, false));
+
+    sent
       .then(
         (result) => {
           if (this.inbox.complete(item.id, slot.incarnation, result)) this.emit("completed", { item, result });

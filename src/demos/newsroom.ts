@@ -21,6 +21,7 @@ import { Inbox } from "../platform/inbox.js";
 import { ListenerService } from "../platform/listeners.js";
 import { Supervisor } from "../platform/supervisor.js";
 import { WorkflowService, type WorkflowDefinition } from "../platform/workflows.js";
+import toy from "../agents/toy.js";
 
 // ── Platform ────────────────────────────────────────────────────────────────
 
@@ -28,7 +29,7 @@ const db = openDatabase("data/platform.db");
 const registry = new AgentRegistry(db);
 const fs = new AgentFilesystem(db, registry, "data");
 const inbox = new Inbox(db, registry);
-const supervisor = new Supervisor(db, registry, { fsHandler: (id, req) => fs.handle(id, req) });
+const supervisor = new Supervisor(db, registry, { defaultModule: toy.moduleUrl, fsHandler: (id, req) => fs.handle(id, req) });
 const dispatcher = new Dispatcher(supervisor, inbox);
 const workflows = new WorkflowService(db, registry, inbox);
 const listeners = new ListenerService(db, registry, fs, inbox, { intervalMs: 150, settleMs: 50 });
@@ -54,7 +55,7 @@ workflows.on("transition", (e) => {
   const doc = workflows.get(e.workflowId)!.input as { name: string };
   const detail = e.detail
     .replaceAll(`-${run}`, "")
-    .replace(/task \S+ failed: Error: /, "")
+    .replace(/task \S+ failed: \w*Error: /, "")
     .replace(/agents\/[0-9a-f-]{36}\//g, "~editor/");
   log("workflow", `[${doc.name}] ${e.event}${detail ? `: ${detail}` : ""}`);
 });
@@ -81,7 +82,7 @@ fs.grant(editor.id, desk, "read");
 // ── Wiring ──────────────────────────────────────────────────────────────────
 
 listeners.register(intake.id, submissions, {
-  payloadTemplate: { action: "transform", from: "{{path}}", to: `${desk}/{{name}}` },
+  payloadTemplate: { task: "transform", input: { from: "{{path}}", to: `${desk}/{{name}}` } },
 });
 
 const pipeline: WorkflowDefinition = {
@@ -90,17 +91,17 @@ const pipeline: WorkflowDefinition = {
     {
       name: "edit",
       agents: [editor.id],
-      payload: { action: "transform", from: "{{input.path}}", to: "~/edited/{{input.name}}.txt", suffix: "\n[edited]", delayMs: 250 },
+      payload: { task: "transform", input: { from: "{{input.path}}", to: "~/edited/{{input.name}}.txt", suffix: "\n[edited]", delayMs: 250 } },
     },
     {
       name: "share",
       agents: [editor.id],
-      payload: { action: "fs", request: { op: "grant", path: "{{steps.edit.path}}", granteeAgentId: senior.id, access: "read" } },
+      payload: { task: "fs", input: { request: { op: "share", path: "{{steps.edit.path}}", agentId: senior.id, access: "read" } } },
     },
     {
       name: "review",
       agents: [junior.id, senior.id],
-      payload: { action: "transform", from: "{{steps.edit.path}}", to: "~/approved/{{input.name}}.txt", suffix: "\n[approved]" },
+      payload: { task: "transform", input: { from: "{{steps.edit.path}}", to: "~/approved/{{input.name}}.txt", suffix: "\n[approved]" } },
     },
   ],
 };
@@ -116,7 +117,7 @@ dispatcher.on("completed", ({ item, result }) => {
 // Chaos: kill the editor in the middle of its first edit.
 let crashed = false;
 dispatcher.on("delivered", ({ item }) => {
-  if (crashed || item.recipientAgentId !== editor.id || (item.payload as { action?: string }).action !== "transform") return;
+  if (crashed || item.recipientAgentId !== editor.id || (item.payload as { task?: string }).task !== "transform") return;
   crashed = true;
   setTimeout(() => {
     const pid = supervisor.status(editor.id)?.pid;

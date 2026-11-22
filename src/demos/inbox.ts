@@ -9,10 +9,11 @@ import { Dispatcher } from "../platform/dispatcher.js";
 import { AgentRegistry } from "../platform/identity.js";
 import { Inbox, type InboxItem } from "../platform/inbox.js";
 import { Supervisor } from "../platform/supervisor.js";
+import toy from "../agents/toy.js";
 
 const db = openDatabase("data/platform.db");
 const registry = new AgentRegistry(db);
-const supervisor = new Supervisor(db, registry);
+const supervisor = new Supervisor(db, registry, { defaultModule: toy.moduleUrl });
 const inbox = new Inbox(db, registry, { maxAttempts: 3 });
 const dispatcher = new Dispatcher(supervisor, inbox);
 
@@ -56,12 +57,12 @@ try {
   const sender = registry.getByName("agent-a") ?? registry.create("agent-a");
 
   step(1, `Agent ${short(agent.id)} is offline. Send it three messages.`);
-  for (const text of ["one", "two", "three"]) inbox.send(agent.id, { text }, { senderAgentId: sender.id });
+  for (const text of ["one", "two", "three"]) inbox.send(agent.id, { task: "uppercase", input: { text } }, { senderAgentId: sender.id });
   console.log(`   inbox: ${counts(agent.id)}   (runtime: ${supervisor.status(agent.id)?.state ?? "none"})`);
 
   step(2, "Send a duplicate using the same idempotency key");
-  const a = inbox.send(agent.id, { text: "four" }, { idempotencyKey: "order-42" });
-  const b = inbox.send(agent.id, { text: "four (again)" }, { idempotencyKey: "order-42" });
+  const a = inbox.send(agent.id, { task: "uppercase", input: { text: "four" } }, { idempotencyKey: "order-42" });
+  const b = inbox.send(agent.id, { task: "uppercase", input: { text: "four (again)" } }, { idempotencyKey: "order-42" });
   console.log(`   both sends returned item ${short(a.id)} / ${short(b.id)} → ${counts(agent.id)}`);
 
   step(3, "Start the agent: everything sent while offline gets delivered");
@@ -70,7 +71,7 @@ try {
   console.log(`   inbox: ${counts(agent.id)}`);
 
   step(4, "Crash the runtime mid-task: the claim is released and redelivered to the next incarnation");
-  const slow = inbox.send(agent.id, { text: "slow", delayMs: 500 });
+  const slow = inbox.send(agent.id, { task: "uppercase", input: { text: "slow", delayMs: 500 } });
   await until(() => inbox.get(slow.id)?.status === "claimed");
   process.kill(supervisor.status(agent.id)!.pid, "SIGKILL");
   await until(() => supervisor.status(agent.id)?.state === "crashed");
@@ -80,7 +81,7 @@ try {
   console.log(`   ${short(slow.id)} completed after ${inbox.get(slow.id)!.attempts} attempts`);
 
   step(5, "A message that always errors is retried, then marked failed");
-  const poison = inbox.send(agent.id, { fail: true });
+  const poison = inbox.send(agent.id, { task: "uppercase", input: { fail: true } });
   await until(() => inbox.get(poison.id)?.status === "failed");
   console.log(`   ${short(poison.id)}: status=failed attempts=${inbox.get(poison.id)!.attempts}`);
 
