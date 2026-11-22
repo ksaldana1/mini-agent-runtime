@@ -9,7 +9,7 @@ import { PermanentError } from "mini-agent-runtime";
 /** Decisions API: gpt-6-luna is the only supported model. */
 export const DECISIONS_MODEL = "gpt-6-luna";
 /** Model for free-form generation (Responses API). Override with OPENAI_MODEL. */
-export const TEXT_MODEL = process.env.OPENAI_MODEL ?? "gpt-6-sol";
+export const TEXT_MODEL = process.env.OPENAI_MODEL ?? "gpt-6-luna";
 
 let client: OpenAI | undefined;
 export function openai(): OpenAI {
@@ -44,7 +44,9 @@ export function score(
   if (a?.type !== "score") return null;
   // `score` is the expected value over 0-based levels (e.g. 2.96), not an index:
   // take the label from the most probable level instead.
-  const top = a.probabilities.reduce((best, p) => (p.probability > best.probability ? p : best));
+  const top = a.probabilities.reduce((best, p) =>
+    p.probability > best.probability ? p : best,
+  );
   return { level: a.score, label: top.label, confidence: a.confidence };
 }
 
