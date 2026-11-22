@@ -53,8 +53,8 @@ function setup(p: Platform, opts: { autostart?: boolean; reviewers?: "both" | "s
   const flow = p
     .workflow("note-and-review")
     .input(z.object({ name: z.string(), text: z.string() }))
-    .step("save", writer, "save", ({ input }) => ({ name: input.name, text: input.text }))
-    .step("review", reviewers, "read", ({ steps }) => ({ path: steps.save.path }))
+    .step("save", writer.task("save"), ({ input }) => ({ name: input.name, text: input.text }))
+    .step("review", reviewers.map((r) => r.task("read")), ({ steps }) => ({ path: steps.save.path }))
     .build();
   return { writer, junior, senior, flow };
 }
@@ -66,22 +66,25 @@ describe("workflow builder (3.1)", () => {
     const flow = p
       .workflow("typed")
       .input(z.object({ name: z.string(), loud: z.boolean().default(false) }))
-      .step("save", a, "save", (ctx) => {
+      .step("save", a.task("save"), (ctx) => {
         expectTypeOf(ctx.input).toEqualTypeOf<{ name: string; loud: boolean }>(); // parsed: defaults applied
         expectTypeOf(ctx.steps).toEqualTypeOf<{}>();
         return { name: ctx.input.name, text: "x" };
       })
-      .step("read", a, "read", (ctx) => {
+      .step("read", a.task("read"), (ctx) => {
         expectTypeOf(ctx.steps.save).toEqualTypeOf<{ attempt: number; incarnation: number; path: string; bytes: number }>();
         // @ts-expect-error no step named "nope" yet
         void ctx.steps.nope;
         return { path: ctx.steps.save.path };
       })
       .build();
-    expectTypeOf(flow).toEqualTypeOf<WorkflowRef<{ name: string; loud?: boolean | undefined }, string>>();
-    expectTypeOf(p.startWorkflow(flow, { name: "n" })).toEqualTypeOf<WorkflowHandle<string>>();
+    type In = { name: string; loud?: boolean | undefined };
+    type Steps = { save: { attempt: number; incarnation: number; path: string; bytes: number }; read: string };
+    expectTypeOf(flow).toEqualTypeOf<WorkflowRef<In, Steps, string>>();
+    expectTypeOf(p.startWorkflow(flow, { name: "n" })).toEqualTypeOf<WorkflowHandle<In, Steps, string>>();
+    expectTypeOf(flow.start).parameter(0).toEqualTypeOf<In>();
 
-    p.workflow("bad-input").input(z.object({})).step("s", a, "save", () =>
+    p.workflow("bad-input").input(z.object({})).step("s", a.task("save"), () =>
       // @ts-expect-error `text` is required by the task
       ({ name: "x" }),
     );
@@ -90,16 +93,11 @@ describe("workflow builder (3.1)", () => {
   it("rejects duplicate names, empty workflows, and tasks the agent doesn't have", () => {
     const p = boot();
     const a = p.agent("a", notes, { autostart: false });
-    p.workflow("w").input(z.object({})).step("s", a, "read", () => ({ path: "x" })).build();
-    expect(() => p.workflow("w").input(z.object({})).step("s", a, "read", () => ({ path: "x" })).build()).toThrow(/already registered/);
+    p.workflow("w").input(z.object({})).step("s", a.task("read"), () => ({ path: "x" })).build();
+    expect(() => p.workflow("w").input(z.object({})).step("s", a.task("read"), () => ({ path: "x" })).build()).toThrow(/already registered/);
     expect(() => p.workflow("empty").input(z.object({})).build()).toThrow(/at least one step/);
-    expect(() =>
-      p
-        .workflow("w2")
-        .input(z.object({}))
-        .step("s", a, "nope" as "read", () => ({ path: "x" }))
-        .build(),
-    ).toThrow(/has no task "nope"/);
+    expect(() => p.workflow("w2").input(z.object({})).step("s", [], () => ({}) as never)).toThrow(/at least one task/);
+    expect(() => a.task("nope" as "read")).toThrow(/unknown task/);
   });
 });
 
@@ -132,8 +130,8 @@ describe("startWorkflow and WorkflowHandle (3.3)", () => {
     const flow = p
       .workflow("doomed")
       .input(z.object({}))
-      .step("save", writer, "save", () => ({ name: "n", text: "t" }))
-      .step("read", stranger, "read", ({ steps }) => ({ path: steps.save.path }))
+      .step("save", writer.task("save"), () => ({ name: "n", text: "t" }))
+      .step("read", stranger.task("read"), ({ steps }) => ({ path: steps.save.path }))
       .build();
     await p.start();
     const err = await p.startWorkflow(flow, {}).result().catch((e: unknown) => e);
@@ -158,9 +156,9 @@ describe("startWorkflow and WorkflowHandle (3.3)", () => {
     await first.close();
 
     const second = boot();
-    setup(second); // code registers the same agents and workflow again
+    const { flow: again } = setup(second); // code registers the same agents and workflow again
     await second.start();
-    await expect(second.workflowRun<string>(run.id).result()).resolves.toBe("survives");
+    await expect(again.run(run.id).result()).resolves.toBe("survives");
   });
 });
 
@@ -204,9 +202,9 @@ describe("listeners defined in code (3.4)", () => {
   it(".send() enqueues a typed task for an agent that can read the directory", async () => {
     const p = boot();
     const clerk = p.agent("clerk", notes);
-    expect(() => p.listen("too-early", { dir: inbox }).send(clerk, "read", (f) => ({ path: f.path }))).toThrow(/EACCES/);
+    expect(() => p.listen("too-early", { dir: inbox }).send(clerk.task("read"), (f) => ({ path: f.path }))).toThrow(/EACCES/);
     clerk.grant(inbox, "read");
-    p.listen("incoming", { dir: inbox }).send(clerk, "read", (f) => ({ path: f.path }));
+    p.listen("incoming", { dir: inbox }).send(clerk.task("read"), (f) => ({ path: f.path }));
     await p.start();
 
     const fired = next(p, "listener.fired");
@@ -233,7 +231,7 @@ describe("listeners defined in code (3.4)", () => {
     const first = boot();
     const a = first.agent("clerk", notes);
     a.grant(inbox, "read");
-    first.listen("incoming", { dir: inbox }).send(a, "read", (f) => ({ path: f.path }));
+    first.listen("incoming", { dir: inbox }).send(a.task("read"), (f) => ({ path: f.path }));
     await first.start();
     const fired = next(first, "listener.fired");
     drop("once.txt");
@@ -242,7 +240,7 @@ describe("listeners defined in code (3.4)", () => {
 
     const second = boot();
     const b = second.agent("clerk", notes);
-    second.listen("incoming", { dir: inbox }).send(b, "read", (f) => ({ path: f.path }));
+    second.listen("incoming", { dir: inbox }).send(b.task("read"), (f) => ({ path: f.path }));
     await second.start();
     await new Promise((r) => setTimeout(r, 150)); // several scans
     expect(b.inbox()).toHaveLength(1);
@@ -294,7 +292,7 @@ describe("listeners defined in code (3.4)", () => {
     const p = boot();
     const a: AgentHandle<typeof notes> = p.agent("clerk", notes);
     a.grant(inbox, "read");
-    const l = p.listen("incoming", { dir: inbox }).send(a, "read", (f) => ({ path: f.path }));
+    const l = p.listen("incoming", { dir: inbox }).send(a.task("read"), (f) => ({ path: f.path }));
     expect(() => p.listen("incoming", { dir: inbox })).toThrow(/already registered/);
     await p.start();
     l.pause();

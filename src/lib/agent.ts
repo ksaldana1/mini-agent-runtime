@@ -19,7 +19,12 @@ import type { z } from "zod";
 
 export type Access = "read" | "write";
 
-export interface AgentContext {
+export interface AgentContext<Config = undefined> {
+  /**
+   * The agent's config, parsed by the definition's `config` schema (undefined without one).
+   * Delivered when the runtime starts: a change takes effect on the next start or restart.
+   */
+  config: Config;
   /** Which logical agent (and which process incarnation of it) is running this task. */
   agent: { id: string; name: string; incarnation: number };
   /** Stable across redeliveries of the same task: use it as an idempotency key for side effects. */
@@ -43,46 +48,58 @@ export interface AgentContext {
 
 // ── Definitions ─────────────────────────────────────────────────────────────
 
-export interface TaskDef<S extends z.ZodType = z.ZodType, Out = unknown> {
+export interface TaskDef<S extends z.ZodType = z.ZodType, Out = unknown, Config = undefined> {
   input: S;
-  run(input: z.output<S>, ctx: AgentContext): Out | Promise<Out>;
+  run(input: z.output<S>, ctx: AgentContext<Config>): Out | Promise<Out>;
 }
 
 /** A task as the host sees it: types erased. */
-type AnyTaskDef = { input: z.ZodType; run(input: never, ctx: AgentContext): unknown };
+type AnyTaskDef = { input: z.ZodType; run(input: never, ctx: AgentContext<never>): unknown };
+
+/** Parsed config type for a config schema (undefined when there's none). */
+type ConfigOf<C> = C extends z.ZodType ? z.output<C> : undefined;
 
 const BRAND = Symbol.for("mini-agent-runtime.agent-definition");
 
-export interface AgentDefinition<Tasks extends Record<string, AnyTaskDef> = Record<string, AnyTaskDef>> {
+export interface AgentDefinition<
+  Tasks extends Record<string, AnyTaskDef> = Record<string, AnyTaskDef>,
+  C extends z.ZodType | undefined = z.ZodType | undefined,
+> {
   readonly [BRAND]: true;
   /** file: URL of the module that defines this agent; the runtime host imports it. */
   readonly moduleUrl: string;
   readonly tasks: Tasks;
+  /** Schema for the agent's config (`platform.agent(name, def, { config })`), if it takes any. */
+  readonly config: C;
 }
 
 /**
  * Define an agent. Pass `import.meta.url` as `moduleUrl` and make this the module's
  * default export. Each task's `run` input type is inferred from its `input` schema.
  */
-export function defineAgent<S extends Record<string, z.ZodType>, R>(
+export function defineAgent<S extends Record<string, z.ZodType>, R, C extends z.ZodType | undefined = undefined>(
   moduleUrl: string,
   // Two homomorphic mapped types so TypeScript can reverse-infer both type parameters
   // from the same object: S from each `input`, then (with `run`'s parameter now
   // contextually typed by S) R from each `run`'s return type. A single mapped type
-  // over S can't infer R.
+  // over S can't infer R. C comes from `config`, which isn't context-sensitive.
   def: {
+    config?: C;
     tasks: { [K in keyof S]: { input: S[K] } } & {
-      [K in keyof R]: { run(input: z.output<S[K & keyof S]>, ctx: AgentContext): R[K] | Promise<R[K]> };
+      [K in keyof R]: { run(input: z.output<S[K & keyof S]>, ctx: AgentContext<ConfigOf<C>>): R[K] | Promise<R[K]> };
     };
   },
-): AgentDefinition<{ [K in keyof S]: TaskDef<S[K], R[K & keyof R]> }> {
+): AgentDefinition<{ [K in keyof S]: TaskDef<S[K], R[K & keyof R], ConfigOf<C>> }, C> {
   if (!moduleUrl.startsWith("file:")) throw new Error(`defineAgent: moduleUrl must be a file: URL (pass import.meta.url), got ${moduleUrl}`);
   for (const [name, task] of Object.entries(def.tasks as Record<string, Partial<TaskDef>>)) {
     if (typeof task?.run !== "function" || typeof task.input?.safeParse !== "function") {
       throw new Error(`defineAgent: task "${name}" needs an \`input\` Zod schema and a \`run\` function`);
     }
   }
-  return Object.freeze({ [BRAND]: true as const, moduleUrl, tasks: def.tasks as never });
+  if (def.config !== undefined && typeof (def.config as Partial<z.ZodType>).safeParse !== "function") {
+    throw new Error("defineAgent: `config` must be a Zod schema");
+  }
+  return Object.freeze({ [BRAND]: true as const, moduleUrl, tasks: def.tasks as never, config: def.config as C });
 }
 
 export function isAgentDefinition(value: unknown): value is AgentDefinition {
@@ -96,6 +113,9 @@ export type TaskNames<D extends AgentDefinition> = keyof D["tasks"] & string;
 
 /** What callers pass to a task (the schema's input type: before defaults/transforms). */
 export type TaskInput<D extends AgentDefinition, K extends TaskNames<D>> = z.input<D["tasks"][K]["input"]>;
+
+/** What `platform.agent(name, def, { config })` accepts (the schema's input type). */
+export type AgentConfigInput<D extends AgentDefinition> = D["config"] extends z.ZodType ? z.input<D["config"]> : undefined;
 
 /** What a task resolves to. */
 export type TaskOutput<D extends AgentDefinition, K extends TaskNames<D>> = Awaited<ReturnType<D["tasks"][K]["run"]>>;

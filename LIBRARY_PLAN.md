@@ -1,6 +1,6 @@
 # Library-ification Plan
 
-> **Status (2026-11-22):** plan and all design decisions (D1–D8) approved. **Phases 0–4 done (4.3 packaging, optional, not started); Phase 4 awaiting review.** Read [Handoff notes](#handoff-notes-for-a-fresh-session) first.
+> **Status (2026-11-22):** plan and all design decisions (D1–D8) approved. **Phases 0–4 done (4.3 packaging, optional, not started).** **Phase 5 (typed references and agent config) done; awaiting review.** Read [Handoff notes](#handoff-notes-for-a-fresh-session) first.
 
 Turn the platform from "seven classes you wire by hand" into a small library with a typed,
 awaitable API. The current classes in `src/platform/` stay as the internal **kernel**. The new
@@ -209,6 +209,59 @@ These are internal changes that the later phases depend on. Every existing test 
 
 ---
 
+## Phase 5: Typed references and agent config
+
+Motivation: `examples/support-desk/main.ts` needs hand-written type aliases, casts, and numeric
+step indexes (`run.steps()[1]`) to report on finished runs, because `build()` drops the step
+types the builder already tracks. Separately, `(agent, taskName)` pairs are repeated across
+`send`, steps, and listeners, with input validation copied three times
+(`platform.ts` listener + `send`, `workflows.ts` `toKernelStep`). And `AgentOptions.configuration`
+is stored and even sent in `INIT`, but the host drops it, so it's write-only.
+
+### Decisions (approved 2026-11-22)
+
+| # | Decision | Recommendation | Why |
+|---|---|---|---|
+| D9 ✓ | `(agent, task)` pairs vs a bound reference | **`agent.task(name)` returns a `TaskRef<In, Out>`.** Steps and listeners take only `TaskRef`s (breaking). `agent.send(task, input)` stays as shorthand for `agent.task(task).send(input)`. | One place for schema lookup and validation. The ref describes the operation; `.send()` (durable, D6) returns the handle for one execution. |
+| D10 ✓ | Fallback candidates under D9 | **An array of `TaskRef`s with the same input type**; the step's output is the union of their outputs. | Today candidates must share a task *name*; this relaxes it to sharing an input *type*, which is the real constraint. |
+| D11 ✓ | Reattaching to a run | **`ref.run(id)`** checks the stored run's workflow name *and* fingerprint (3.2) against the ref and throws `WorkflowMismatchError` otherwise. `platform.workflowRun(id)` stays, but returns an untyped handle and loses its free `<Out>` generic. | Today any caller can assert any output type. The fingerprint already exists, so the check costs nothing. It catches reordered or renamed steps, not edited closures. Document that limit. |
+| D12 ✓ | When config changes take effect | **On the next start or restart of the runtime.** Config is delivered in `INIT`, validated in both processes. Rename `configuration` → `config` everywhere (pre-1.0). | Reading it per task adds a DB read per task for little gain; restart semantics are easy to explain. |
+| D13 ✓ | Workflow output | **Optional `.output(({ input, steps }) => ...)`**, run inside the transaction that completes the last step. A throw fails the workflow with `output: <message>`, with no retry (it's deterministic). Whether a projection exists is part of the fingerprint. Without `.output()`, the last step's output is the result, as today. | No crash window, so no step with no agent and no extra state. Lowest priority; see 5.4. |
+
+### ☑ 5.1 `TaskRef` · M
+- `agent.task(name)` returns `TaskRef<TaskInput<D, K>, TaskOutput<D, K>>` with `agent`, `task`, and `send(input, { idempotencyKey? })`, which returns a `TaskHandle<Out>`.
+- One internal `validateTaskInput(ref, value)`, used by `send`, steps, and listeners. The three copies go.
+- `step(name, refOrRefs, (ctx) => input)` and `listen(...).send(ref, (file) => input)` replace the `(agent, task, ...)` forms. Port the newsroom, support-desk, README, and tests.
+- **Done when:** type tests cover `TaskRef` inference, a step with fallback refs of different tasks with the same input type, and a rejection when fallback input types differ. The three validation copies are gone.
+
+### ☑ 5.2 Typed workflow refs and handles · M
+- `build()` returns `WorkflowRef<In, Steps, Out>` with `start(input, opts?)` and `run(id)` (D11). `platform.startWorkflow(ref, ...)` stays as a thin alias.
+- `WorkflowHandle<In, Steps, Out>` adds:
+  - `input(): In`.
+  - `step<N extends keyof Steps>(name: N)`: a union discriminated on `status`. `"completed"` has `result: Steps[N]`. `"waiting" | "assigned" | "failed"` have `result: null` (and `error` when failed).
+  - `result(): Promise<Out>`, as today.
+- `steps()` and `status()` stay untyped, for timelines and generic tooling.
+- **Done when:** type tests show `run.step("triage")` narrows on `status === "completed"`, and `ref.run(id)` throws for a run of another workflow and for a fingerprint mismatch. No `as` casts are needed in example reporting code.
+
+### ☑ 5.3 Agent config · S
+- `defineAgent(url, { config: zodSchema, tasks })`. `ctx.config` is typed as the schema's output (`undefined` when no schema is given).
+- `platform.agent(name, def, { config })` is typed as the schema's input and validated there (throws). The host validates it again in `INIT`; a failure refuses the start (permanent, like a bad module).
+- Config changes take effect on the next start or restart (D12). Document it in the README and on `AgentOptions`.
+- Add one line to the README: config values like directories don't grant filesystem access; grants are still explicit.
+- **Done when:** there are tests for a typed `ctx.config`, a registration-time validation error, a host-side refusal, and a change seen after `restart()` but not before.
+
+### ☑ 5.4 Workflow `.output()` (optional; see D13) · S
+- Implements D13 in the kernel's last-step branch (`WorkflowService`, where it calls `finish(..., item.result)` today).
+- **Done when:** there are tests for the projected result, a throwing projection failing the run, and the result surviving a restart (it's stored in `workflows.output`).
+- Skip this if the support-desk reporting is already short after 5.2.
+
+### ☑ 5.5 Port the examples · S
+- support-desk: the responder reads `draftsDir` / `escalationsDir` from `ctx.config`; `main.ts` reports through `run.step(...)` (or `.output()`), with no type aliases, casts, or step indexes.
+- newsroom: `TaskRef`s and `run.input()`, no `as` casts.
+- **Done when:** both examples run with the same outcome, and `rg ' as ' examples/` turns up only casts that aren't about workflow or task types.
+
+---
+
 ## Out of scope
 
 Each of these stays in `ARCHITECTURE.md` §10:
@@ -222,10 +275,10 @@ Each of these stays in `ARCHITECTURE.md` §10:
 ## Sequencing and checkpoints
 
 ```text
-Phase 0 ──▶ Phase 1 ──▶ Phase 2 ──▶ Phase 3 ──▶ Phase 4
-(0.1–0.5     (needs 0.3,  (needs 0.2,   (needs 0.1,   (needs all)
- independent  0.4)         0.4, 0.5)     2.x)
- of each other)
+Phase 0 ──▶ Phase 1 ──▶ Phase 2 ──▶ Phase 3 ──▶ Phase 4 ──▶ Phase 5
+(0.1–0.5     (needs 0.3,  (needs 0.2,   (needs 0.1,   (needs all)  (5.1 → 5.2 in one breaking pass;
+ independent  0.4)         0.4, 0.5)     2.x)                       5.3 independent; 5.4 after 5.2;
+ of each other)                                                     5.5 last)
 ```
 
 After each phase:
@@ -274,6 +327,19 @@ Read these before touching code.
   - The newsroom is `examples/newsroom/` (`main.ts` + `agents/{intake,editor,reviewer}.ts`), public API only. `main.ts` is 80 lines, down from 199, so about 40% rather than a third. The agent modules add 52. Intake became a workflow step, which removed the glue; the listener starts the workflow directly. It wipes `examples/newsroom/data` on each run (the data directory is gitignored).
   - The kernel's `TaskError` message is now the runtime's own message, without a `task <id> failed:` prefix.
   - 4.3 (packaging) is optional and not started.
+- Phase 5 notes (from reviewing the support-desk example):
+  - `examples/support-desk/` uses OpenAI: the Decisions API (`client.decisions.create`, model `gpt-6-luna`) for triage and QA, and the Responses API for drafts. It loads `.env` with `process.loadEnvFile()`, and forked runtimes inherit the env. `npm run demo:support` needs `OPENAI_API_KEY` and makes real calls, so it isn't part of the "every demo runs" check unless a key is present.
+  - Decisions `score` answers are an expected value over levels numbered from 0 (e.g. 2.96), not an index. `openai.ts` takes the label from the most probable level.
+  - Its `main.ts` reporting block (type aliases, `outputOf(run, i)`) is the "before" picture for 5.2 and 5.4.
+  - Typecheck with `./node_modules/.bin/tsc --noEmit`. The rtk-wrapped `npx tsc` can resolve another tsc and report dozens of bogus implicit-any errors.
+- Phase 5 implementation notes:
+  - 162 tests (15 new in `tests/library-refs.test.ts`, with fixtures `shouter.ts` and `configured.ts`). `tsc` clean, every demo runs, and support-desk ran against the live API with the same outcome as before.
+  - Kernel: `WorkflowStepDefinition.tasks?` (per-candidate task names, parallel to `agents`) and `WorkflowDefinition.output?`. The fingerprint keeps its old shape when every candidate runs the same task and there's no output, so in-flight runs of unchanged definitions carry over. `workflows.fingerprint(name)` backs `ref.run(id)`.
+  - Typing: `TaskRef`'s `In` is made invariant through a type-only `__types.in: (i: In) => In`; `step()` infers `R` (the union of the candidates' refs) from `readonly R[]` and intersects with a `SameInput<R>` check. `NoInfer` keeps the step function's return value from widening `In`.
+  - `TaskRefImpl` (`@internal`) holds the schema; `taskRefImpl(ref)` rejects refs not made by `agent.task()`. `agent.task("nope")` throws `TaskInputError` ("unknown task"), as `send` did.
+  - `.output(fn)` returns an object with only `build()`, so steps can't follow it. The lib parses the stored input with the schema before calling it, as it does for step inputs.
+  - Config: `platform.agent()` validates (`AgentConfigError`) before touching the registry; omitting `config` keeps the stored one, which must still fit the schema. The host validates again in `INIT` and refuses the start (non-retryable). `AgentContext<Config = undefined>`.
+  - `platform.workflowRun(id)` is untyped now; the newsroom and support-desk use `ref.run(id)`. Support-desk's reporting is an `.output()` projection plus one `console.table`.
 - Work is committed on `main`; commit at the end of each phase so every phase has a clean diff.
 
 **Environment quirks (macOS, not Linux):**

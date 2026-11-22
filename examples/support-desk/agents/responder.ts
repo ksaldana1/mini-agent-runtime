@@ -18,10 +18,13 @@ const Triage = z.object({
 });
 
 export default defineAgent(import.meta.url, {
+  // Deployment settings, not per-ticket input. Directories named here still need grants.
+  config: z.object({ draftsDir: z.string(), escalationsDir: z.string() }),
   tasks: {
     respond: {
-      input: z.object({ triage: Triage, draftsDir: z.string(), escalationsDir: z.string() }),
-      async run({ triage, draftsDir, escalationsDir }, ctx) {
+      input: z.object({ triage: Triage }),
+      async run({ triage }, ctx) {
+        const { draftsDir, escalationsDir } = ctx.config;
         const ticket = await ctx.fs.read(triage.path);
         const reasons = [
           (triage.needsHuman ?? 0) > 0.5 && "needs a human",

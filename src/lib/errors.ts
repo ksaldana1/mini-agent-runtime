@@ -76,3 +76,29 @@ export class WorkflowFailedError extends Error {
     this.name = "WorkflowFailedError";
   }
 }
+
+/**
+ * `ref.run(id)` refused to reattach: the run belongs to another workflow, or was started
+ * with a different definition (fingerprint) than the one registered under the ref's name.
+ */
+export class WorkflowMismatchError extends Error {
+  constructor(
+    readonly workflowId: string,
+    readonly expected: string,
+    readonly reason: string,
+  ) {
+    super(`workflow run ${workflowId} is not a run of ${expected}: ${reason}`);
+    this.name = "WorkflowMismatchError";
+  }
+}
+
+/** `platform.agent()` refused the agent's config: it doesn't match the definition's config schema. */
+export class AgentConfigError extends Error {
+  constructor(
+    readonly agent: string,
+    message: string,
+  ) {
+    super(`invalid config for agent ${agent}: ${message}`);
+    this.name = "AgentConfigError";
+  }
+}

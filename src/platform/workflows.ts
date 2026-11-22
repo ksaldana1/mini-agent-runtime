@@ -20,6 +20,8 @@ export interface WorkflowStepDefinition {
   agents: string[];
   /** Task name on the agent. */
   task: string;
+  /** Per-candidate task names, parallel to `agents`. Defaults to `task` for every candidate. */
+  tasks?: string[];
   /**
    * Computes the task input when the step is assigned. The result is stored in the inbox,
    * so it runs once per assignment, not on every recovery. If it throws, the workflow fails.
@@ -30,6 +32,12 @@ export interface WorkflowStepDefinition {
 export interface WorkflowDefinition {
   name: string;
   steps: WorkflowStepDefinition[];
+  /**
+   * Computes the workflow's output from its input and every step's result. Runs in the
+   * transaction that completes the last step; if it throws, the workflow fails (no retry:
+   * it's deterministic). Without it, the last step's result is the output.
+   */
+  output?(ctx: StepContext): unknown;
 }
 
 export type WorkflowStatus = "running" | "completed" | "failed";
@@ -130,18 +138,29 @@ export class WorkflowService extends EventEmitter {
       if (names.has(s.name)) throw new Error(`workflow ${def.name}: step names must be unique (${s.name})`);
       names.add(s.name);
       if (s.agents.length === 0) throw new Error(`workflow ${def.name}, step ${s.name}: needs at least one agent`);
+      if (s.tasks && s.tasks.length !== s.agents.length) throw new Error(`workflow ${def.name}, step ${s.name}: tasks must be parallel to agents`);
       for (const a of s.agents) if (!this.registry.get(a)) throw new Error(`workflow ${def.name}, step ${s.name}: unknown agent ${a}`);
     }
-    const fingerprint = createHash("sha256")
-      .update(JSON.stringify(def.steps.map((s) => [s.name, s.task, s.agents.map((a) => this.registry.get(a)!.name)])))
-      .digest("hex")
-      .slice(0, 16);
+    // Shape kept stable for definitions that existed before per-candidate tasks and
+    // outputs, so their running workflows don't fail with "definition changed".
+    const shape: unknown[] = def.steps.map((s) => {
+      const tasks = s.tasks ?? s.agents.map(() => s.task);
+      const names = s.agents.map((a) => this.registry.get(a)!.name);
+      return tasks.every((t) => t === s.task) ? [s.name, s.task, names] : [s.name, tasks, names];
+    });
+    if (def.output) shape.push("output");
+    const fingerprint = createHash("sha256").update(JSON.stringify(shape)).digest("hex").slice(0, 16);
     this.definitions.set(def.name, { def, fingerprint });
     return fingerprint;
   }
 
   isRegistered(name: string): boolean {
     return this.definitions.has(name);
+  }
+
+  /** Fingerprint of the definition registered under `name`, if any. */
+  fingerprint(name: string): string | undefined {
+    return this.definitions.get(name)?.fingerprint;
   }
 
   // ── Runs ──────────────────────────────────────────────────────────────────
@@ -278,6 +297,15 @@ export class WorkflowService extends EventEmitter {
       if (next < def.steps.length) {
         this.db.prepare(`UPDATE workflows SET current_step = ?, updated_at = ? WHERE id = ?`).run(next, now(), wf.id);
         this.assign(this.get(wf.id)!, def, next, 1);
+      } else if (def.output) {
+        let output: unknown;
+        try {
+          output = def.output({ input: wf.input, steps: this.stepResults(wf.id), workflow: { id: wf.id } });
+        } catch (err) {
+          this.finish(wf.id, "failed", null, `output: ${(err as Error).message}`);
+          return true;
+        }
+        this.finish(wf.id, "completed", output, null);
       } else {
         this.finish(wf.id, "completed", item.result, null);
       }
@@ -319,7 +347,7 @@ export class WorkflowService extends EventEmitter {
       }
       const item = this.inbox.send(
         agentId,
-        { task: s.task, input },
+        { task: s.tasks?.[k - 1] ?? s.task, input },
         { idempotencyKey: `workflow:${wf.id}:step:${index}:assignment:${k}` },
       );
       this.updateStep(wf.id, index, { status: "assigned", assignment: k, agentId, inboxItemId: item.id, started: true });

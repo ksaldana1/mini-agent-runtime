@@ -14,10 +14,11 @@ export type {
   RuntimeStatus,
   TaskHandle,
   TaskInfo,
+  TaskRef,
 } from "./platform.js";
 
 export { defineAgent } from "./agent.js";
-export type { Access, AgentContext, AgentDefinition, TaskDef, TaskInput, TaskNames, TaskOutput } from "./agent.js";
+export type { Access, AgentConfigInput, AgentContext, AgentDefinition, TaskDef, TaskInput, TaskNames, TaskOutput } from "./agent.js";
 
 export type {
   FileEvent,
@@ -32,8 +33,18 @@ export type {
   WorkflowRef,
   WorkflowStatus,
   WorkflowStepInfo,
+  WorkflowStepSnapshot,
 } from "./workflows.js";
 
-export { FsDeniedError, PermanentError, TaskFailedError, TaskInputError, WorkflowFailedError, WorkflowInputError } from "./errors.js";
+export {
+  AgentConfigError,
+  FsDeniedError,
+  PermanentError,
+  TaskFailedError,
+  TaskInputError,
+  WorkflowFailedError,
+  WorkflowInputError,
+  WorkflowMismatchError,
+} from "./errors.js";
 
 export type { PlatformEventName, PlatformEvents, TaskStatus } from "./events.js";

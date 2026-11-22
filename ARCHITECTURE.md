@@ -604,7 +604,9 @@ All five milestones are implemented (see README). This section records what the 
 **Library API**
 - An agent's name is its identity. Renaming an agent in code creates a new agent with an empty inbox and directory; the old one lingers in the database.
 - `TaskHandle.result()` promises still waiting when the platform closes never settle. Reattach after the next boot with `platform.task(id)`.
-- Task results cross IPC as JSON, so values like `Date` or `Map` don't keep their types, even though `TaskOutput` says they do.
+- Task results cross IPC as JSON, so values like `Date` or `Map` don't keep their types, even though `TaskOutput` says they do. The same goes for a workflow's `.output()` result, which is stored as JSON.
+- Agent config is delivered when a runtime starts. Changing it (re-registering with a new `config`) doesn't reach a running runtime until it restarts.
+- `ref.run(id)` checks the run's fingerprint, which covers step names, tasks, and candidate agents, but not the code of step input or output functions. A run reattached after such an edit is still accepted.
 
 **Lifecycle**
 - Restart policies live in memory and must be set again on every boot. Crash counts for the restart window are not persisted either.
@@ -633,6 +635,7 @@ All five milestones are implemented (see README). This section records what the 
 - Changing a workflow's steps (names, tasks, or candidate agents) fails its running workflows with `definition changed`. There is no migration or versioning of in-flight runs yet.
 - A running workflow whose definition is no longer registered just waits; nothing cleans it up.
 - Step outputs are typed from the task's return type, but not validated at runtime.
+- The fingerprint format changed in Phase 5 only for definitions that use per-candidate tasks or `.output()`. Definitions without either keep their old fingerprint, so their in-flight runs carry over.
 
 **Development**
 - Runtimes are started with `--import tsx` and there is no build step. That keeps development simple, but every runtime pays TypeScript transpilation cost at startup.

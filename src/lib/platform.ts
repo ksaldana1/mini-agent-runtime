@@ -5,7 +5,8 @@
  *   const platform = createPlatform({ dataDir: "data" });
  *   const editor = platform.agent("editor", editorDef, { restart: "on-crash" });
  *   await platform.start();                          // recovery, listeners, autostart agents
- *   const out = await editor.send("edit", { path }).result();
+ *   const edit = editor.task("edit");                // a TaskRef: the operation
+ *   const out = await edit.send({ path }).result();  // a TaskHandle: one execution
  *   await platform.close();
  */
 import { join } from "node:path";
@@ -19,8 +20,16 @@ import { ListenerService } from "../platform/listeners.js";
 import { Supervisor, type RestartPolicy, type RuntimeInfo, type RuntimeRecord, type RuntimeState } from "../platform/supervisor.js";
 import { WorkflowService, type Workflow, type WorkflowEvent } from "../platform/workflows.js";
 import type { Listener } from "../platform/listeners.js";
-import { isAgentDefinition, type Access, type AgentDefinition, type TaskInput, type TaskNames, type TaskOutput } from "./agent.js";
-import { TaskFailedError, TaskInputError } from "./errors.js";
+import {
+  isAgentDefinition,
+  type Access,
+  type AgentConfigInput,
+  type AgentDefinition,
+  type TaskInput,
+  type TaskNames,
+  type TaskOutput,
+} from "./agent.js";
+import { AgentConfigError, TaskFailedError, TaskInputError } from "./errors.js";
 import { PlatformEventEmitter, type TaskStatus } from "./events.js";
 import {
   ListenerHandleImpl,
@@ -32,6 +41,7 @@ import {
   type ListenerBuilder,
   type ListenerHandle,
   type ListenOptions,
+  type StepSpec,
   type WorkflowHandle,
   type WorkflowRef,
 } from "./workflows.js";
@@ -50,13 +60,18 @@ export interface PlatformOptions {
 
 export type { RestartPolicy, RuntimeRecord, RuntimeState };
 
-export interface AgentOptions {
+export interface AgentOptions<D extends AgentDefinition = AgentDefinition> {
   /** Default "on-crash" (with the kernel's default backoff and cap). */
   restart?: "never" | "on-crash" | RestartPolicy;
   /** Start a runtime in platform.start() (or right away, if already started). Default true. */
   autostart?: boolean;
-  /** Stored with the agent's identity and handed to its runtimes. */
-  configuration?: Record<string, unknown>;
+  /**
+   * The agent's config, validated against the definition's `config` schema (AgentConfigError
+   * otherwise). Stored with the agent's identity; omit it to keep the stored config. Runtimes
+   * receive it when they start, so a change takes effect on the next start or restart.
+   * Config doesn't grant anything: a directory named here still needs `grant()`.
+   */
+  config?: AgentConfigInput<D>;
 }
 
 export interface RuntimeStatus {
@@ -94,6 +109,23 @@ export interface TaskHandle<Out = unknown> {
   result(): Promise<Out>;
 }
 
+/**
+ * One task of one agent: the operation, not an execution. Pass it to workflow steps and
+ * listeners, or `send()` it. Get one with `agent.task(name)`.
+ */
+export interface TaskRef<In = unknown, Out = unknown> {
+  readonly agent: { readonly id: string; readonly name: string };
+  readonly task: string;
+  /**
+   * Durably enqueue this task. The input is validated against the task's schema first;
+   * invalid input throws TaskInputError and nothing is enqueued. With the same
+   * idempotencyKey, a repeat send returns a handle to the original task.
+   */
+  send(input: In, opts?: { idempotencyKey?: string }): TaskHandle<Out>;
+  /** Type-only, never set. `In` is invariant, so fallback candidates must agree on their input. */
+  readonly __types?: { in: (input: In) => In; out: Out };
+}
+
 export interface AgentHandle<D extends AgentDefinition = AgentDefinition> {
   readonly id: string;
   readonly name: string;
@@ -110,11 +142,9 @@ export interface AgentHandle<D extends AgentDefinition = AgentDefinition> {
   revoke(path: string): void;
   /** Tasks addressed to this agent, oldest first. */
   inbox(status?: TaskStatus): TaskInfo[];
-  /**
-   * Durably enqueue a task. The input is validated against the task's schema first;
-   * invalid input throws TaskInputError and nothing is enqueued. With the same
-   * idempotencyKey, a repeat send returns a handle to the original task.
-   */
+  /** A reference to one of this agent's tasks. Throws TaskInputError for an unknown task. */
+  task<K extends TaskNames<D>>(task: K): TaskRef<TaskInput<D, K>, TaskOutput<D, K>>;
+  /** Shorthand for `agent.task(task).send(input, opts)`. */
   send<K extends TaskNames<D>>(task: K, input: TaskInput<D, K>, opts?: { idempotencyKey?: string }): TaskHandle<TaskOutput<D, K>>;
 }
 
@@ -161,7 +191,7 @@ export class Platform implements AsyncDisposable {
    * Register an agent's code under a name, creating the agent the first time. The name is
    * the identity: the same name on a later boot gets the same agent (same id, inbox, files).
    */
-  agent<D extends AgentDefinition>(name: string, definition: D, opts: AgentOptions = {}): AgentHandle<D> {
+  agent<D extends AgentDefinition>(name: string, definition: D, opts: AgentOptions<D> = {}): AgentHandle<D> {
     this.assertOpen();
     if (this.handles.has(name)) throw new Error(`agent "${name}" is already registered in this process`);
     if (!isAgentDefinition(definition)) throw new Error(`agent "${name}": not an agent definition (use defineAgent)`);
@@ -169,10 +199,15 @@ export class Platform implements AsyncDisposable {
 
     let agent = registry.getByName(name);
     if (agent && agent.lifecycleState !== "active") throw new Error(`agent "${name}" is ${agent.lifecycleState}`);
-    if (!agent) agent = registry.create(name, opts.configuration ?? {});
-    else if (opts.configuration && JSON.stringify(opts.configuration) !== JSON.stringify(agent.configuration)) {
-      registry.updateConfiguration(agent.id, opts.configuration);
+    // Validate before touching the registry, so a bad config changes nothing. Without a
+    // new config, the stored one must still fit the (possibly changed) schema.
+    const config = (opts.config ?? agent?.configuration ?? {}) as Record<string, unknown>;
+    if (definition.config) {
+      const parsed = definition.config.safeParse(config);
+      if (!parsed.success) throw new AgentConfigError(name, z.prettifyError(parsed.error));
     }
+    if (!agent) agent = registry.create(name, config);
+    else if (JSON.stringify(config) !== JSON.stringify(agent.configuration)) registry.updateConfiguration(agent.id, config);
 
     supervisor.setModule(agent.id, definition.moduleUrl);
     const restart = opts.restart ?? "on-crash";
@@ -206,27 +241,42 @@ export class Platform implements AsyncDisposable {
    * Start a run of a workflow. The input is validated first (WorkflowInputError, nothing
    * started). With the same idempotencyKey, a repeat start returns the original run.
    */
-  startWorkflow<In, Out>(workflow: WorkflowRef<In, Out>, input: In, opts: { idempotencyKey?: string } = {}): WorkflowHandle<Out> {
-    this.assertOpen();
-    const schema = this.workflowSchemas.get(workflow.name);
-    if (!schema) throw new Error(`workflow ${workflow.name} is not registered in this platform`);
-    validateWorkflowInput(workflow.name, schema, input);
-    const run = this.kernel.workflows.start(workflow.name, input, opts);
-    return new WorkflowHandleImpl<Out>(this, run.id);
+  startWorkflow<In, Steps extends Record<string, unknown>, Out>(
+    workflow: WorkflowRef<In, Steps, Out>,
+    input: NoInfer<In>,
+    opts: { idempotencyKey?: string } = {},
+  ): WorkflowHandle<In, Steps, Out> {
+    return workflow.start(input, opts);
   }
 
-  /** Reattach to a workflow run by id, e.g. one started by an earlier process. */
-  workflowRun<Out = unknown>(id: string): WorkflowHandle<Out> {
+  /** @internal Shared by WorkflowRef.start() and listeners. Returns the run id. */
+  startRun(name: string, input: unknown, opts: { idempotencyKey?: string } = {}): string {
     this.assertOpen();
-    return new WorkflowHandleImpl<Out>(this, id);
+    const schema = this.workflowSchemas.get(name);
+    if (!schema) throw new Error(`workflow ${name} is not registered in this platform`);
+    validateWorkflowInput(name, schema, input);
+    return this.kernel.workflows.start(name, input, opts).id;
+  }
+
+  /**
+   * Reattach to any workflow run by id, untyped (for timelines and tooling). To get a typed
+   * handle, use the workflow's ref: `ref.run(id)` also checks the run belongs to it.
+   */
+  workflowRun(id: string): WorkflowHandle {
+    this.assertOpen();
+    return new WorkflowHandleImpl(this, id);
   }
 
   /** @internal Called by WorkflowBuilder.build(). */
-  registerWorkflow(name: string, schema: z.ZodType, specs: Parameters<typeof toKernelStep>[2][]): void {
+  registerWorkflow(name: string, schema: z.ZodType, specs: StepSpec[], output?: (ctx: { input: unknown; steps: Record<string, unknown>; workflow: { id: string } }) => unknown): void {
     this.assertOpen();
     if (this.workflowSchemas.has(name)) throw new Error(`workflow "${name}" is already registered in this process`);
     if (specs.length === 0) throw new Error(`workflow "${name}" needs at least one step`);
-    this.kernel.workflows.register({ name, steps: specs.map((s) => toKernelStep(name, schema, s)) });
+    this.kernel.workflows.register({
+      name,
+      steps: specs.map((s) => toKernelStep(name, schema, s)),
+      output: output && ((ctx) => output({ ...ctx, input: schema.parse(ctx.input) })),
+    });
     this.workflowSchemas.set(name, schema);
     // Registered after start(): let runs of this workflow catch up right away.
     if (this.lifecycle === "started") this.kernel.workflows.recover();
@@ -235,7 +285,7 @@ export class Platform implements AsyncDisposable {
   // ── Listeners ─────────────────────────────────────────────────────────────
 
   /**
-   * Watch a directory. Pick a target with `.send(agent, task, fn)` or
+   * Watch a directory. Pick a target with `.send(agent.task(name), fn)` or
    * `.startWorkflow(workflow, fn)`. Registration is by name and survives restarts: files
    * already seen don't fire again. Changing `dir` resets what has been seen.
    */
@@ -249,30 +299,23 @@ export class Platform implements AsyncDisposable {
       return new ListenerHandleImpl(this, name, l.id);
     };
     return {
-      send: (agent, task, input) => {
-        const def = Object.hasOwn(agent.definition.tasks, task) ? agent.definition.tasks[task] : undefined;
-        if (!def) throw new Error(`listener ${name}: agent ${agent.name} has no task "${task}"`);
+      send: (task, input) => {
+        const ref = taskRefImpl(task);
         return register({
           kind: "agent",
-          agentId: agent.id,
+          agentId: ref.agent.id,
           payload: (e) => {
             const value = input(toFileEvent(e));
-            const parsed = def.input.safeParse(value);
-            if (!parsed.success) throw new TaskInputError(task, agent.name, z.prettifyError(parsed.error));
-            return { task, input: value };
+            ref.validate(value);
+            return { task: ref.task, input: value };
           },
         });
       },
       startWorkflow: (workflow, input) => {
-        const schema = this.workflowSchemas.get(workflow.name);
-        if (!schema) throw new Error(`listener ${name}: workflow ${workflow.name} is not registered in this platform`);
+        if (!this.workflowSchemas.has(workflow.name)) throw new Error(`listener ${name}: workflow ${workflow.name} is not registered in this platform`);
         return register({
           kind: "platform",
-          fire: (e: Parameters<typeof toFileEvent>[0], idempotencyKey: string) => {
-            const value = input(toFileEvent(e));
-            validateWorkflowInput(workflow.name, schema, value);
-            return this.kernel.workflows.start(workflow.name, value, { idempotencyKey }).id;
-          },
+          fire: (e: Parameters<typeof toFileEvent>[0], idempotencyKey: string) => this.startRun(workflow.name, input(toFileEvent(e)), { idempotencyKey }),
         });
       },
     };
@@ -494,20 +537,47 @@ class AgentHandleImpl<D extends AgentDefinition> implements AgentHandle<D> {
     return this.platform.kernel.inbox.list(this.id, status).map((i) => this.platform.taskInfo(i));
   }
 
-  send<K extends TaskNames<D>>(task: K, input: TaskInput<D, K>, opts: { idempotencyKey?: string } = {}): TaskHandle<TaskOutput<D, K>> {
-    this.platform.assertOpen();
+  task<K extends TaskNames<D>>(task: K): TaskRef<TaskInput<D, K>, TaskOutput<D, K>> {
     const tasks = this.definition.tasks;
     const def = Object.hasOwn(tasks, task) ? tasks[task] : undefined;
     if (!def) throw new TaskInputError(task, this.name, `unknown task (this agent has: ${Object.keys(tasks).join(", ")})`);
-    // Fail fast in the caller's process. The runtime validates again on delivery.
-    const parsed = def.input.safeParse(input);
-    if (!parsed.success) throw new TaskInputError(task, this.name, z.prettifyError(parsed.error));
+    return new TaskRefImpl(this.platform, { id: this.id, name: this.name }, task, def.input);
+  }
 
+  send<K extends TaskNames<D>>(task: K, input: TaskInput<D, K>, opts: { idempotencyKey?: string } = {}): TaskHandle<TaskOutput<D, K>> {
+    return this.task(task).send(input, opts);
+  }
+}
+
+/** @internal The one place a task's input is checked before it's stored (send, steps, listeners). */
+export class TaskRefImpl<In, Out> implements TaskRef<In, Out> {
+  constructor(
+    private readonly platform: Platform,
+    readonly agent: { readonly id: string; readonly name: string },
+    readonly task: string,
+    private readonly schema: z.ZodType,
+  ) {}
+
+  /** Throws TaskInputError. The runtime validates again on delivery. */
+  validate(input: unknown): void {
+    const parsed = this.schema.safeParse(input);
+    if (!parsed.success) throw new TaskInputError(this.task, this.agent.name, z.prettifyError(parsed.error));
+  }
+
+  send(input: In, opts: { idempotencyKey?: string } = {}): TaskHandle<Out> {
+    this.platform.assertOpen();
+    this.validate(input);
     // Store the caller's input, not the parsed output: the runtime parses it with the
     // same schema, and parsing an already-transformed value isn't guaranteed to work.
-    const item = this.platform.kernel.inbox.send(this.id, { task, input }, { idempotencyKey: opts.idempotencyKey });
+    const item = this.platform.kernel.inbox.send(this.agent.id, { task: this.task, input }, { idempotencyKey: opts.idempotencyKey });
     return new TaskHandleImpl(this.platform, item.id);
   }
+}
+
+/** @internal */
+export function taskRefImpl(ref: TaskRef<any, any>): TaskRefImpl<unknown, unknown> {
+  if (!(ref instanceof TaskRefImpl)) throw new Error("expected a TaskRef from agent.task(name)");
+  return ref as TaskRefImpl<unknown, unknown>;
 }
 
 class TaskHandleImpl<Out> implements TaskHandle<Out> {

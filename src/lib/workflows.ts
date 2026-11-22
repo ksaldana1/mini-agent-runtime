@@ -4,9 +4,13 @@
  *
  *   const publish = platform.workflow("publish")
  *     .input(z.object({ path: z.string() }))
- *     .step("edit", editor, "edit", ({ input }) => ({ path: input.path }))
- *     .step("review", [junior, senior], "review", ({ steps }) => ({ path: steps.edit.path }))
+ *     .step("edit", editor.task("edit"), ({ input }) => ({ path: input.path }))
+ *     .step("review", [junior.task("review"), senior.task("review")], ({ steps }) => ({ path: steps.edit.path }))
  *     .build();
+ *
+ *   const run = publish.start({ path });
+ *   const edit = run.step("edit");
+ *   if (edit.status === "completed") edit.result.path; // typed
  *
  *   platform.listen("submissions", { dir: "shared/documents/in" })
  *     .startWorkflow(publish, (file) => ({ path: file.path }));
@@ -14,20 +18,33 @@
 import { z } from "zod";
 import type { FileEvent as KernelFileEvent, Listener, ListenerEvent } from "../platform/listeners.js";
 import type { StepStatus, Workflow, WorkflowEvent, WorkflowStatus, WorkflowStep } from "../platform/workflows.js";
-import type { AgentDefinition, TaskInput, TaskNames, TaskOutput } from "./agent.js";
-import { TaskInputError, WorkflowFailedError, WorkflowInputError } from "./errors.js";
-import type { AgentHandle, Platform } from "./platform.js";
+import { WorkflowFailedError, WorkflowInputError, WorkflowMismatchError } from "./errors.js";
+import { taskRefImpl, type Platform, type TaskRef, type TaskRefImpl } from "./platform.js";
 
 // ── Public types ────────────────────────────────────────────────────────────
 
-/** A registered workflow. `In` is what startWorkflow accepts; `Out` is the last step's output. */
-export interface WorkflowRef<In, Out> {
+type AnySteps = Record<string, unknown>;
+
+/**
+ * A registered workflow. `In` is what `start` accepts (the schema's input type), `Steps`
+ * maps each step name to its output, and `Out` is the workflow's result.
+ */
+export interface WorkflowRef<In = unknown, Steps extends AnySteps = AnySteps, Out = unknown> {
   readonly name: string;
-  /** Type-only: carries In and Out. Never set at runtime. */
-  readonly __types?: { in: In; out: Out };
+  /**
+   * Start a run. The input is validated first (WorkflowInputError, nothing started). With
+   * the same idempotencyKey, a repeat start returns the original run.
+   */
+  start(input: In, opts?: { idempotencyKey?: string }): WorkflowHandle<In, Steps, Out>;
+  /**
+   * Reattach to a run by id, e.g. one started by an earlier process. Throws
+   * WorkflowMismatchError if the run belongs to another workflow, or was started with a
+   * different definition (step names, tasks, candidates; not the step functions' code).
+   */
+  run(id: string): WorkflowHandle<In, Steps, Out>;
 }
 
-/** What a step's input function sees. */
+/** What a step's input function (and `.output()`) sees. */
 export interface StepContext<In, Steps> {
   /** The workflow input, parsed by its schema. */
   input: In;
@@ -62,16 +79,28 @@ export interface WorkflowStepInfo {
   finishedAt: string | null;
 }
 
+/** One step of a run, narrowed on `status`: `result` is typed (and set) only once it's completed. */
+export type WorkflowStepSnapshot<Result = unknown> = Omit<WorkflowStepInfo, "status" | "result" | "error"> &
+  (
+    | { status: "completed"; result: Result; error: null }
+    | { status: "waiting" | "assigned"; result: null; error: null }
+    | { status: "failed"; result: null; error: string }
+  );
+
 export type { WorkflowEvent, WorkflowStatus, StepStatus };
 
-export interface WorkflowHandle<Out = unknown> {
+export interface WorkflowHandle<In = unknown, Steps extends AnySteps = AnySteps, Out = unknown> {
   readonly id: string;
   readonly workflow: string;
+  /** The input the run was started with (as given to `start`, before parsing). */
+  input(): In;
+  /** One step by name. Throws for a name the workflow doesn't have. */
+  step<N extends keyof Steps & string>(name: N): WorkflowStepSnapshot<Steps[N]>;
   status(): WorkflowInfo;
   steps(): WorkflowStepInfo[];
   /** The append-only transition log. */
   events(): WorkflowEvent[];
-  /** Resolves with the last step's output, or rejects with WorkflowFailedError. No polling. */
+  /** Resolves with the workflow's output, or rejects with WorkflowFailedError. No polling. */
   result(): Promise<Out>;
 }
 
@@ -105,33 +134,36 @@ export interface ListenerHandle {
 
 export interface ListenerBuilder {
   /**
-   * Enqueue a task for `agent` for each file event. The agent must be allowed to read
-   * `dir` (a listener reveals file names to its target).
+   * Enqueue `task` for each file event. Its agent must be allowed to read `dir` (a
+   * listener reveals file names to its target).
    */
-  send<D extends AgentDefinition, K extends TaskNames<D>>(
-    agent: AgentHandle<D>,
-    task: K,
-    input: (file: FileEvent) => TaskInput<D, K>,
-  ): ListenerHandle;
+  send<In>(task: TaskRef<In, unknown>, input: (file: FileEvent) => NoInfer<In>): ListenerHandle;
   /**
    * Start a run of `workflow` for each file event. Platform-owned: no agent's permission
    * is involved. The run is started in the same transaction that records the file as seen,
    * with idempotency key listener:<name>:<event>:<path>:<mtime>, so a crash can't lose or
    * duplicate it.
    */
-  startWorkflow<In>(workflow: WorkflowRef<In, unknown>, input: (file: FileEvent) => In): ListenerHandle;
+  startWorkflow<In>(workflow: WorkflowRef<In, any, unknown>, input: (file: FileEvent) => NoInfer<In>): ListenerHandle;
 }
 
 // ── Builder ─────────────────────────────────────────────────────────────────
 
 type Simplify<T> = { [K in keyof T]: T[K] } & {};
+type AnyTaskRef = TaskRef<any, any>;
+type RefIn<R> = R extends TaskRef<infer I, any> ? I : never;
+type RefOut<R> = R extends TaskRef<any, infer O> ? O : never;
+/** Fallback candidates must take the same input (TaskRef's `In` is invariant). */
+type SameInput<R> = [R] extends [TaskRef<RefIn<R>, unknown>] ? unknown : { "fallback candidates must take the same input": never };
 
-interface StepSpec {
+/** @internal */
+export interface StepSpec {
   name: string;
-  agents: AgentHandle<AgentDefinition>[];
-  task: string;
-  input: (ctx: StepContext<unknown, Record<string, unknown>>) => unknown;
+  refs: TaskRefImpl<unknown, unknown>[];
+  input: (ctx: StepContext<unknown, AnySteps>) => unknown;
 }
+
+type OutputFn = (ctx: StepContext<unknown, AnySteps>) => unknown;
 
 /** First stage of platform.workflow(name): every workflow declares its input schema. */
 export class WorkflowStart {
@@ -145,7 +177,7 @@ export class WorkflowStart {
   }
 }
 
-export class WorkflowBuilder<In, InRaw, Steps extends Record<string, unknown>, Out> {
+export class WorkflowBuilder<In, InRaw, Steps extends AnySteps, Out> {
   constructor(
     private readonly platform: Platform,
     private readonly name: string,
@@ -154,46 +186,79 @@ export class WorkflowBuilder<In, InRaw, Steps extends Record<string, unknown>, O
   ) {}
 
   /**
-   * Add a step: run `task` on `agents` (the first, then fallbacks if it fails) with the
-   * input computed from the workflow input and earlier steps' outputs.
+   * Add a step: run `task` (or the first of several candidates, then the others as
+   * fallbacks if it fails) with the input computed from the workflow input and earlier
+   * steps' outputs. Candidates may be different tasks, as long as they take the same input;
+   * the step's output is the union of theirs.
    */
-  step<N extends string, D extends AgentDefinition, K extends TaskNames<D>>(
+  step<N extends string, R extends AnyTaskRef>(
     name: N,
-    agents: AgentHandle<D> | readonly AgentHandle<D>[],
-    task: K,
-    input: (ctx: StepContext<In, Steps>) => TaskInput<D, K>,
-  ): WorkflowBuilder<In, InRaw, Simplify<Steps & { [P in N]: TaskOutput<D, K> }>, TaskOutput<D, K>> {
-    const list = (Array.isArray(agents) ? [...agents] : [agents]) as AgentHandle<AgentDefinition>[];
-    const spec: StepSpec = { name, agents: list, task, input: input as StepSpec["input"] };
+    task: (R | readonly R[]) & SameInput<R>,
+    input: (ctx: StepContext<In, Steps>) => NoInfer<RefIn<R>>,
+  ): WorkflowBuilder<In, InRaw, Simplify<Steps & { [P in N]: RefOut<R> }>, RefOut<R>> {
+    const list = (Array.isArray(task) ? [...task] : [task]) as AnyTaskRef[];
+    if (list.length === 0) throw new Error(`workflow ${this.name}, step ${name}: needs at least one task`);
+    const spec: StepSpec = { name, refs: list.map(taskRefImpl), input: input as StepSpec["input"] };
     return new WorkflowBuilder(this.platform, this.name, this.schema, [...this.specs, spec]);
   }
 
+  /**
+   * Declare the workflow's result, computed from its input and every step's output once the
+   * last step completes (instead of the last step's output). It's part of the definition:
+   * the result is stored, and a throw fails the workflow, without retry. Keep it pure and
+   * return JSON-serializable data.
+   */
+  output<O>(fn: (ctx: StepContext<In, Steps>) => O): { build(): WorkflowRef<InRaw, Steps, O> } {
+    return { build: () => this.register(fn as OutputFn) };
+  }
+
   /** Register the workflow with the platform. */
-  build(): WorkflowRef<InRaw, Out> {
-    this.platform.registerWorkflow(this.name, this.schema, this.specs);
-    return { name: this.name };
+  build(): WorkflowRef<InRaw, Steps, Out> {
+    return this.register();
+  }
+
+  private register<O>(output?: OutputFn): WorkflowRef<InRaw, Steps, O> {
+    this.platform.registerWorkflow(this.name, this.schema, this.specs, output);
+    return new WorkflowRefImpl(this.platform, this.name);
+  }
+}
+
+class WorkflowRefImpl<In, Steps extends AnySteps, Out> implements WorkflowRef<In, Steps, Out> {
+  constructor(
+    private readonly platform: Platform,
+    readonly name: string,
+  ) {}
+
+  start(input: In, opts: { idempotencyKey?: string } = {}): WorkflowHandle<In, Steps, Out> {
+    return new WorkflowHandleImpl(this.platform, this.platform.startRun(this.name, input, opts));
+  }
+
+  run(id: string): WorkflowHandle<In, Steps, Out> {
+    this.platform.assertOpen();
+    const wf = this.platform.kernel.workflows.get(id);
+    if (!wf) throw new Error(`unknown workflow run ${id}`);
+    if (wf.name !== this.name) throw new WorkflowMismatchError(id, this.name, `it is a run of ${wf.name}`);
+    if (wf.fingerprint !== this.platform.kernel.workflows.fingerprint(this.name)) {
+      throw new WorkflowMismatchError(id, this.name, "it was started with a different definition");
+    }
+    return new WorkflowHandleImpl(this.platform, id);
   }
 }
 
 // ── Kernel adapters (used by Platform) ─────────────────────────────────────
 
 /** Turns a typed step spec into the kernel's step definition (validation included). */
-export function toKernelStep(workflow: string, schema: z.ZodType, spec: StepSpec) {
-  for (const a of spec.agents) {
-    if (!Object.hasOwn(a.definition.tasks, spec.task)) {
-      throw new Error(`workflow ${workflow}, step ${spec.name}: agent ${a.name} has no task "${spec.task}"`);
-    }
-  }
-  const taskSchema = spec.agents[0]!.definition.tasks[spec.task]!.input;
+export function toKernelStep(_workflow: string, schema: z.ZodType, spec: StepSpec) {
   return {
     name: spec.name,
-    agents: spec.agents.map((a) => a.id),
-    task: spec.task,
-    input: (ctx: { input: unknown; steps: Record<string, unknown>; workflow: { id: string } }) => {
+    agents: spec.refs.map((r) => r.agent.id),
+    task: spec.refs[0]!.task,
+    tasks: spec.refs.map((r) => r.task),
+    input: (ctx: { input: unknown; steps: AnySteps; workflow: { id: string } }) => {
       const value = spec.input({ input: schema.parse(ctx.input), steps: ctx.steps, workflow: ctx.workflow });
-      // Like send(): check in the platform process, store the raw value.
-      const parsed = taskSchema.safeParse(value);
-      if (!parsed.success) throw new TaskInputError(spec.task, spec.agents[0]!.name, z.prettifyError(parsed.error));
+      // Like send(): check in the platform process, store the raw value. Every candidate
+      // gets the same input, so it must fit every candidate's schema.
+      for (const ref of spec.refs) ref.validate(value);
       return value;
     },
   };
@@ -208,7 +273,7 @@ export function toFileEvent(e: KernelFileEvent): FileEvent {
   return { listener: e.listener, event: e.event, path: e.path, name: e.name };
 }
 
-export class WorkflowHandleImpl<Out> implements WorkflowHandle<Out> {
+export class WorkflowHandleImpl<In = unknown, Steps extends AnySteps = AnySteps, Out = unknown> implements WorkflowHandle<In, Steps, Out> {
   readonly workflow: string;
 
   constructor(
@@ -223,6 +288,21 @@ export class WorkflowHandleImpl<Out> implements WorkflowHandle<Out> {
   status(): WorkflowInfo {
     this.platform.assertOpen();
     return toInfo(this.platform.kernel.workflows.get(this.id)!);
+  }
+
+  input(): In {
+    return this.status().input as In;
+  }
+
+  step<N extends keyof Steps & string>(name: N): WorkflowStepSnapshot<Steps[N]> {
+    const s = this.steps().find((x) => x.name === name);
+    if (!s) throw new Error(`workflow ${this.workflow} has no step "${name}"`);
+    // Normalize so the union holds: a result only when completed, an error only when failed.
+    return {
+      ...s,
+      result: s.status === "completed" ? s.result : null,
+      error: s.status === "failed" ? (s.error ?? "failed") : null,
+    } as WorkflowStepSnapshot<Steps[N]>;
   }
 
   steps(): WorkflowStepInfo[] {

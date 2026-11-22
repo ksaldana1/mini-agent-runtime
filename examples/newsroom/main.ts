@@ -7,7 +7,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { z } from "zod";
-import { createPlatform, type WorkflowHandle } from "mini-agent-runtime";
+import { createPlatform } from "mini-agent-runtime";
 import editorDef from "./agents/editor.js";
 import intakeDef from "./agents/intake.js";
 import reviewerDef from "./agents/reviewer.js";
@@ -28,19 +28,18 @@ editor.grant(DESK, "read"); // nobody grants the reviewers anything: the editor 
 const publish = platform
   .workflow("publish-article")
   .input(z.object({ path: z.string(), name: z.string() }))
-  .step("intake", intake, "file", ({ input }) => ({ from: input.path, to: `${DESK}/${input.name}.txt` }))
-  .step("edit", editor, "edit", ({ input, steps }) => ({ path: steps.intake.path, name: input.name }))
-  .step("share", editor, "share", ({ steps }) => ({ path: steps.edit.path, with: senior.id }))
-  .step("review", [junior, senior], "review", ({ input, steps }) => ({ path: steps.edit.path, name: input.name }))
+  .step("intake", intake.task("file"), ({ input }) => ({ from: input.path, to: `${DESK}/${input.name}.txt` }))
+  .step("edit", editor.task("edit"), ({ input, steps }) => ({ path: steps.intake.path, name: input.name }))
+  .step("share", editor.task("share"), ({ steps }) => ({ path: steps.edit.path, with: senior.id }))
+  .step("review", [junior.task("review"), senior.task("review")], ({ input, steps }) => ({ path: steps.edit.path, name: input.name }))
   .build();
 platform.listen("submissions", { dir: SUBMISSIONS }).startWorkflow(publish, (file) => ({ path: file.path, name: basename(file.name, ".txt") }));
 
 // Timeline. Agent directories are shown as ~name instead of agents/<id>.
 const t0 = Date.now();
-const nameOf = (run: WorkflowHandle<unknown>) => (run.status().input as { name: string }).name;
 platform.events.onAny((name, e) => {
   if (!/^(agent\.|listener\.fired|task\.attempt|workflow\.transition)/.test(name) || ("event" in e && e.event === "workflow_started")) return;
-  const who = "workflowId" in e && e.workflowId ? `[${nameOf(platform.workflowRun(e.workflowId))}]` : "agent" in e && e.agent ? e.agent : "";
+  const who = "workflowId" in e && e.workflowId ? `[${publish.run(e.workflowId).input().name}]` : "agent" in e && e.agent ? e.agent : "";
   const what = "detail" in e ? `${e.event}: ${e.detail}` : "error" in e ? (e.error ?? "") : "pid" in e ? `#${e.incarnation} pid ${e.pid} ${"state" in e ? e.state : ""}` : "delayMs" in e ? `in ${e.delayMs}ms` : "path" in e ? e.path : "";
   console.log(`+${((Date.now() - t0) / 1000).toFixed(2)}s  ${name.padEnd(20)} ${who.padEnd(16)} ${staff.reduce((s, a) => s.replaceAll(`agents/${a.id}`, `~${a.name}`), what)}`);
 });
@@ -50,8 +49,8 @@ platform.events.on("fs.denied", (e) => (denials[e.agent] = (denials[e.agent] ?? 
 // Chaos: kill the editor in the middle of its first edit.
 const stopChaos = platform.events.on("task.delivered", (e) => e.task === "edit" && (stopChaos(), setTimeout(() => process.kill(editor.status()!.pid, "SIGKILL"), 100)));
 
-const runs: WorkflowHandle<{ path: string }>[] = [];
-const allFiled = new Promise((done) => platform.events.on("listener.fired", (e) => runs.push(platform.workflowRun(e.workflowId!)) === 3 && done(0)));
+const runs: ReturnType<typeof publish.run>[] = [];
+const allFiled = new Promise((done) => platform.events.on("listener.fired", (e) => runs.push(publish.run(e.workflowId!)) === 3 && done(0)));
 
 await platform.start(); // every agent is offline; the listener is already watching
 mkdirSync(join(DATA, SUBMISSIONS), { recursive: true });
@@ -65,10 +64,10 @@ await allFiled;
 const approved = await Promise.all(runs.map((run) => run.result()));
 
 console.table(runs.map((run, i) => ({
-  article: nameOf(run),
+  article: run.input().name,
   status: run.status().status,
-  "edit attempts": platform.task(run.steps()[1]!.taskId!).status().attempts,
-  "reviewed by": run.steps()[3]!.agent,
+  "edit attempts": platform.task(run.step("edit").taskId!).status().attempts,
+  "reviewed by": run.step("review").agent,
   approved: readFileSync(join(DATA, approved[i]!.path), "utf8").replaceAll("\n", " / "),
 })));
 console.table(staff.map((a) => ({

@@ -10,7 +10,8 @@ brief are implemented, and the platform is packaged as a small typed library (se
 The platform is a small library ([LIBRARY_PLAN.md](LIBRARY_PLAN.md)): agents are typed modules,
 and the platform hands out typed, awaitable handles. The public entry point is the package itself
 (`"exports": "./src/lib/index.ts"`, run through `tsx`; there's no build step yet).
-`examples/newsroom/` is a complete example (`npm run demo:newsroom`).
+`examples/newsroom/` is a complete example (`npm run demo:newsroom`). `examples/support-desk/` is a
+second one that calls OpenAI (`npm run demo:support`, needs `OPENAI_API_KEY`, read from `.env`).
 
 An agent is a module whose default export is `defineAgent(import.meta.url, { tasks })`:
 
@@ -40,8 +41,10 @@ const agent = platform.agent("notes", notes, { restart: "on-crash" }); // by nam
 agent.grant("shared/documents", "read");
 
 await platform.start();                         // recovery, listeners, autostart agents
-const task = agent.send("save", { name: "a", text: "hello" }); // typed, validated before enqueueing
+const save = agent.task("save");                // a TaskRef: the operation, typed by the task
+const task = save.send({ name: "a", text: "hello" }); // validated, then durably enqueued
 const out = await task.result();                // resolves on settlement; no polling
+// agent.send("save", { ... }) is shorthand for the same thing.
 ```
 
 Workflows and listeners are code too, registered by name on every boot:
@@ -49,15 +52,18 @@ Workflows and listeners are code too, registered by name on every boot:
 ```ts
 const review = platform.workflow("note-and-review")
   .input(z.object({ name: z.string(), text: z.string() }))
-  .step("save", writer, "save", ({ input }) => ({ name: input.name, text: input.text }))
-  .step("review", [junior, senior], "read", ({ steps }) => ({ path: steps.save.path })) // typed
+  .step("save", writer.task("save"), ({ input }) => ({ name: input.name, text: input.text }))
+  .step("review", [junior.task("read"), senior.task("read")], ({ steps }) => ({ path: steps.save.path })) // typed
   .build();
 
 platform.listen("submissions", { dir: "shared/documents/in" })
   .startWorkflow(review, (file) => ({ name: file.name, text: file.path }));
 
-const run = platform.startWorkflow(review, { name: "memo", text: "hi" });
-const text = await run.result();                // the last step's output
+const run = review.start({ name: "memo", text: "hi" });
+const text = await run.result();                // the last step's output (or `.output(...)`'s)
+const save = run.step("save");
+if (save.status === "completed") save.result.path; // typed once completed
+const again = review.run(run.id);               // typed reattach; checks the run is this workflow's
 ```
 
 - **Lifecycle.** `createPlatform` only wires the services. `start()` runs recovery (stale runtime rows,
@@ -66,16 +72,31 @@ const text = await run.result();                // the last step's output
 - **Agents** are registered by name on every boot (D3). The name is the identity, so the same name
   gets the same id, inbox, and files. Registering a name twice in one process is an error. The
   default restart policy is `on-crash`.
-- **`send(task, input)`** validates `input` with the task's schema in the caller's process
-  (`TaskInputError`, nothing enqueued), then enqueues `{ task, input }` durably. `result()` resolves
-  once the task completes, across crashes and redeliveries, or rejects with `TaskFailedError`.
-  `platform.task(id)` reattaches to a task from an earlier process.
+- **Agent config.** A definition can declare `config: zodSchema`; handlers get it parsed and typed as
+  `ctx.config`. Pass it with `platform.agent(name, def, { config })`: it's validated there
+  (`AgentConfigError`, nothing changed) and stored with the agent's identity. Omit it to keep the
+  stored config. Runtimes receive it when they start, so **a change takes effect on the next start
+  or restart**, and the host refuses to start with a stored config that doesn't fit the schema.
+  Config doesn't grant anything: a directory named in config still needs `grant()`.
+- **`TaskRef`s.** `agent.task(name)` is a reference to one task: the operation, not an execution.
+  `ref.send(input)` validates `input` with the task's schema in the caller's process
+  (`TaskInputError`, nothing enqueued), then enqueues `{ task, input }` durably and returns a
+  `TaskHandle`. `result()` resolves once the task completes, across crashes and redeliveries, or
+  rejects with `TaskFailedError`. `platform.task(id)` reattaches to a task from an earlier process.
+  Workflow steps and listeners take `TaskRef`s too, so validation happens in one place.
 - **Workflows** (`platform.workflow(name).input(schema).step(...).build()`) are typed end to end:
   each step's input function sees the parsed workflow input and the outputs of the steps before it,
-  and must return the task's input type. `startWorkflow(ref, input, { idempotencyKey })` validates
-  the input (`WorkflowInputError`) and returns a `WorkflowHandle` (`status`, `steps`, `events`,
-  `result`). `platform.workflowRun(id)` reattaches.
-- **Listeners** (`platform.listen(name, { dir })`) either `.send(agent, task, fn)` (the agent must
+  and must return the task's input type. A step's fallback candidates can be different tasks as long
+  as they take the same input (otherwise it's a type error); the step's output is the union of
+  theirs. `.output(({ input, steps }) => ...)` before `.build()` declares the workflow's result
+  (default: the last step's output); it runs when the last step completes, its result is stored, and
+  a throw fails the workflow. `ref.start(input, { idempotencyKey })` (or
+  `platform.startWorkflow(ref, ...)`) validates the input (`WorkflowInputError`) and returns a
+  `WorkflowHandle`: `input()`, `step(name)` (typed `result` once `status === "completed"`),
+  `status`, `steps`, `events`, `result`. `ref.run(id)` reattaches with types, and throws
+  `WorkflowMismatchError` if the run belongs to another workflow or another definition (by
+  fingerprint). `platform.workflowRun(id)` reattaches to any run, untyped.
+- **Listeners** (`platform.listen(name, { dir })`) either `.send(taskRef, fn)` (the task's agent must
   be able to read `dir`) or `.startWorkflow(ref, fn)` (platform-owned, no permission check).
 - **Events.** `platform.events` re-emits kernel events with agent names. A complete timeline logger:
 
@@ -150,11 +171,11 @@ which forks **runtime hosts** (`src/runtime/host.ts`) that load agent modules. S
 | `src/platform/listeners.ts` | Named, persistent subscriptions. Periodically scans watched directories against a saved snapshot; for new or changed files, calls the target registered in code (enqueue a task, or start a workflow). |
 | `src/platform/workflows.ts` | Durable sequential workflows defined in code. Each step is an inbox item; progress comes from the item's stored status. Reassigns failed steps to fallback agents. |
 | `src/runtime/host.ts` | The child process: a generic host. Starts anonymous; `INIT` tells it who it is and which agent module to import. Validates each `TASK`'s input with the named task's schema, runs the handler with a context (`ctx.fs` sends `FS_REQUEST` to the platform), and handles `PING` / `SHUTDOWN`. |
-| `src/lib/agent.ts` | `defineAgent(import.meta.url, { tasks })`: an agent's code. Typed tasks (Zod input schema + `run(input, ctx)`), `AgentContext`, and the `TaskNames` / `TaskInput` / `TaskOutput` helper types. |
+| `src/lib/agent.ts` | `defineAgent(import.meta.url, { config?, tasks })`: an agent's code. Typed tasks (Zod input schema + `run(input, ctx)`), an optional config schema (typed `ctx.config`), `AgentContext`, and the `TaskNames` / `TaskInput` / `TaskOutput` / `AgentConfigInput` helper types. |
 | `src/lib/errors.ts` | `PermanentError` and `FsDeniedError` (fail a task without retries); `TaskFailedError` and `TaskInputError` (thrown to callers). |
-| `src/lib/platform.ts` | `createPlatform`: wires the kernel, runs recovery in `start()`, and hands out typed `AgentHandle`s and `TaskHandle`s. |
+| `src/lib/platform.ts` | `createPlatform`: wires the kernel, runs recovery in `start()`, validates agent config, and hands out typed `AgentHandle`s, `TaskRef`s (the one place task input is validated), and `TaskHandle`s. |
 | `src/lib/events.ts` | `platform.events`: one typed emitter for everything observable, with agent names. |
-| `src/lib/workflows.ts` | The typed workflow builder, `WorkflowHandle`, and the listener builder. |
+| `src/lib/workflows.ts` | The typed workflow builder (steps take `TaskRef`s; optional `.output()`), `WorkflowRef` (`start`, checked `run`), `WorkflowHandle` (typed `input()` and `step(name)`), and the listener builder. |
 | `src/lib/index.ts` | The public entry point. Exports the library, never kernel classes. |
 | `src/agents/toy.ts` | The toy agent the milestone demos use: `uppercase`, `transform`, and `fs` tasks. |
 | `src/demos/*.ts` | The milestone demos: tours of the kernel, wired by hand. |
@@ -189,9 +210,10 @@ export default defineAgent(import.meta.url, {
 - **Tasks.** The host looks up the task by name, validates the input with the task's Zod schema, and
   calls `run(input, ctx)`. Unknown task names and invalid input are **non-retryable**, as are
   `PermanentError` and `FsDeniedError` thrown from a handler. Any other error is retried.
-- **Context.** `ctx.agent` (`id`, `name`, `incarnation`), `ctx.taskId` (stable across redeliveries:
-  use it as an idempotency key), `ctx.attempt`, `ctx.log`, and `ctx.fs` (`read`, `write`, `list`,
-  `share`, `revoke`).
+- **Context.** `ctx.config` (parsed by the definition's `config` schema; `undefined` without one),
+  `ctx.agent` (`id`, `name`, `incarnation`), `ctx.taskId` (stable across redeliveries: use it as an
+  idempotency key), `ctx.attempt`, `ctx.log`, and `ctx.fs` (`read`, `write`, `list`, `share`,
+  `revoke`).
 - **Types.** Each handler's input type comes from its schema, and its output type from its return
   value. `TaskInput<typeof def, "transform">` and `TaskOutput<typeof def, "transform">` expose them to callers.
 
@@ -302,8 +324,9 @@ filesystem ──scan──▶ ListenerService ──inbox.send─────�
 ### Workflows
 
 A workflow is a named list of steps, defined in code and registered on every boot. Each step names
-candidate agents (the first one, then fallbacks), a task, and a function that computes the task's
-input from the workflow input, earlier steps' results, and the workflow id.
+candidates (an agent and a task each: the first one, then fallbacks), and a function that computes
+the task's input from the workflow input, earlier steps' results, and the workflow id. An optional
+output function computes the workflow's result from the input and every step's result.
 
 ```text
 WorkflowService ──inbox.send──▶ Inbox ──Dispatcher──▶ runtime
@@ -312,11 +335,11 @@ WorkflowService ──inbox.send──▶ Inbox ──Dispatcher──▶ runtim
       └──── recover() at startup (reconcileAll)
 ```
 
-- **Code defines the steps; SQLite holds the progress** (D1). A run stores its workflow's name and a **fingerprint** (a hash of step names, tasks, and candidate agent names), never the definition. On reconcile, a run whose workflow isn't registered in this process is skipped (`"skipped"`); one whose registered definition has a different fingerprint is failed with `definition changed`. Input functions aren't part of the fingerprint, so changing *how* an input is computed is fine.
+- **Code defines the steps; SQLite holds the progress** (D1). A run stores its workflow's name and a **fingerprint** (a hash of step names, each candidate's task and agent name, and whether there's an output function), never the definition. On reconcile, a run whose workflow isn't registered in this process is skipped (`"skipped"`); one whose registered definition has a different fingerprint is failed with `definition changed`. Input functions aren't part of the fingerprint, so changing *how* an input is computed is fine.
 - **Nothing is replayed.** A step's input function runs once, when the step is assigned, and its result is stored in the inbox item. If it throws, the workflow fails.
 - **Idempotent starts.** `start(name, input, { idempotencyKey })`: a repeat start of the same workflow with the same key returns the original run. `waitFor(id)` resolves once a run completes or fails.
 - **Workflows sit on top of the inbox.** A workflow never talks to a runtime. Assigning a step means `inbox.send` with the idempotency key `workflow:<id>:step:<n>:assignment:<k>`. Delivery, crash redelivery, and retry limits all come from the inbox and dispatcher.
-- **Progress comes from stored state.** `reconcile()` looks at the current step's inbox item. If it's `completed`, the result is saved and the next step is assigned (or the workflow completes). If it's `failed`, the step goes to the next candidate agent (or the workflow fails). If it's pending or claimed, nothing happens. Because it only reads the database, calling it repeatedly is safe, and each transition runs in one transaction.
+- **Progress comes from stored state.** `reconcile()` looks at the current step's inbox item. If it's `completed`, the result is saved and the next step is assigned (or the workflow completes: with the output function's result if there is one, computed in the same transaction, so there's no crash window; a throw fails the workflow with `output: <message>`). If it's `failed`, the step goes to the next candidate agent (or the workflow fails). If it's pending or claimed, nothing happens. Because it only reads the database, calling it repeatedly is safe, and each transition runs in one transaction.
 - **Events for speed, a startup pass for recovery.** The inbox's `"settled"` event triggers `reconcile` immediately, including when a crash release is what failed the item. On startup, `recover()` catches anything that finished while no service was listening.
 - **Two levels of retry:** retrying *the same agent* (crash or error, up to `maxAttempts`) is the inbox's job. Moving work *to a different agent* is the workflow's job.
 - **Workflow state stays separate from agent state.** Agents don't know they are part of a workflow; they just get tasks. All progress lives in `workflows`, `workflow_steps`, and `workflow_events` (an append-only list of transitions).

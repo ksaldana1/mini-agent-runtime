@@ -28,6 +28,8 @@ interface Identity {
 
 let identity: Identity | undefined;
 let definition: AgentDefinition | undefined;
+/** Parsed by the definition's config schema at INIT (undefined without a schema). */
+let config: unknown;
 
 function reply(msg: AgentResponse): void {
   process.send!(msg);
@@ -68,6 +70,13 @@ async function init(msg: Extract<AgentMessage, { type: "INIT" }>): Promise<void>
       throw new Error(`${msg.module}: default export is not an agent definition (export default defineAgent(...))`);
     }
     definition = mod.default;
+    if (definition.config) {
+      // Validated in the platform process too; this catches a config stored by another
+      // version of the code. Like a bad module: the start is refused, not retried.
+      const parsed = definition.config.safeParse(msg.configuration);
+      if (!parsed.success) throw new Error(`invalid config for agent ${msg.name}: ${z.prettifyError(parsed.error)}`);
+      config = parsed.data;
+    }
   } catch (err) {
     reply({ type: "ERROR", message: (err as Error).message ?? String(err), correlationId: "__init__", retryable: false });
     return;
@@ -89,14 +98,15 @@ async function runTask(msg: Extract<AgentMessage, { type: "TASK" }>): Promise<un
   if (!input.success) {
     throw Object.assign(new Error(`invalid input for task "${msg.task}": ${z.prettifyError(input.error)}`), { retryable: false });
   }
-  const ctx: AgentContext = {
+  const ctx: AgentContext<unknown> = {
+    config,
     agent: { id: identity!.agentId, name: identity!.name, incarnation: identity!.incarnation },
     taskId: msg.taskId,
     attempt: msg.attempt,
     log,
     fs: fsClient,
   };
-  return task.run(input.data as never, ctx);
+  return task.run(input.data as never, ctx as AgentContext<never>);
 }
 
 function handle(msg: AgentMessage): void {
