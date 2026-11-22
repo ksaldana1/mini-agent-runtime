@@ -1,0 +1,36 @@
+{
+  "name": "mini-agent-runtime",
+  "version": "1.0.0",
+  "description": "Toy local agent platform: agents as OS processes with persistent identity",
+  "scripts": {
+    "demo": "tsx src/index.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ksaldana1/mini-agent-runtime.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/ksaldana1/mini-agent-runtime/issues"
+  },
+  "homepage": "https://github.com/ksaldana1/mini-agent-runtime#readme",
+  "dependencies": {
+    "better-sqlite3": "^13.2.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.6.6",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.1"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
