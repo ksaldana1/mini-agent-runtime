@@ -72,7 +72,7 @@ export interface SendOptions {
  * only apply if that incarnation still holds the claim, so a late answer from a
  * dead process can't clobber a redelivery (a simple fencing token).
  *
- * Emits "enqueued" (InboxItem) when a new item is stored.
+ * Emits "enqueued" (InboxItem) after a new item is stored (asynchronously, next microtask).
  */
 export class Inbox extends EventEmitter {
   private readonly maxAttempts: number;
@@ -120,7 +120,9 @@ export class Inbox extends EventEmitter {
       );
     }
     const item = this.get(id)!;
-    this.emit("enqueued", item);
+    // Deferred so a caller's enclosing transaction commits before anyone reacts
+    // (e.g. the dispatcher pushing the item to a runtime over IPC).
+    queueMicrotask(() => this.emit("enqueued", item));
     return item;
   }
 

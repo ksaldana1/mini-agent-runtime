@@ -1,7 +1,7 @@
 # mini-agent-runtime
 
 A toy local agent platform where agents behave like OS processes / Erlang actors.
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full brief. **Status: Milestone 3 (shared filesystem).**
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full brief. **Status: Milestone 4 (listeners).**
 
 ## Run
 
@@ -10,6 +10,7 @@ npm install
 npm run demo:lifecycle   # M1: create Agent A, start / task / stop / restart / crash / recover
 npm run demo:inbox       # M2: offline delivery, dedupe, crash redelivery, retries
 npm run demo:fs          # M3: private dirs, closed shared area, sharing one file, audit log
+npm run demo:listeners   # M4: files trigger tasks while the agent (or platform) is offline
 npm test                 # vitest
 npm run typecheck
 ```
@@ -27,6 +28,7 @@ reloads Agent A from `data/platform.db` and continues its incarnation count.
  │ Dispatcher ───── inbox → runtime   (push, 1 in flight per agent)
  │ Supervisor ───── runtimes table    (incarnation history)
  │ AgentFilesystem ─ fs_grants, fs_audit (checks every file op)
+ │ ListenerService ─ listeners, listener_files (periodic scan → inbox)
  │     │  agentId → live ChildProcess (at most one)
  └─────┼─────────────────────────────────────────────────┘
        │ fork() + IPC, Zod-validated messages (both directions)
@@ -43,6 +45,7 @@ reloads Agent A from `data/platform.db` and continues its incarnation count.
 | `src/platform/inbox.ts` | Durable inbox: `pending → claimed → completed / failed`. Idempotency keys, claims fenced by incarnation, retry limit. Pure SQLite, no processes. |
 | `src/platform/dispatcher.ts` | Push delivery. Hands the oldest pending item to a running, idle runtime; releases claims when a runtime exits. |
 | `src/platform/filesystem.ts` | Platform-checked file access: path normalization, ownership + grants, audit log, atomic writes. |
+| `src/platform/listeners.ts` | Persistent subscriptions. Periodically scans watched directories against a saved snapshot and enqueues inbox items for new or changed files. |
 | `src/runtime/agent.ts` | The child process. Starts anonymous, learns who it is from `INIT`, handles `TASK` / `PING` / `SHUTDOWN`, and sends `FS_REQUEST` to the platform for any file access. |
 
 ### Agent vs runtime
@@ -112,6 +115,26 @@ Related caveat: the symlink check happens before the operation, so a symlink cre
 (a time-of-check/time-of-use race) could still slip through. That's fine for trusted runtimes,
 and another reason real isolation belongs in the OS.
 
+### Listeners
+
+A listener is a stored rule: *when a file is created (or modified) under directory X, enqueue a task
+for agent A.* It is owned by the platform and never talks to a runtime:
+
+```text
+filesystem ──scan──▶ ListenerService ──inbox.send──▶ Inbox ──Dispatcher──▶ runtime (whenever it's up)
+                        │
+                        └─ listener_files snapshot (SQLite)
+```
+
+- **Periodic scan, not `fs.watch`.** Each pass lists the directory recursively and compares path, mtime, and size against the stored snapshot. Because the snapshot persists, files created while the platform was down are noticed on the next scan after it restarts. The cost is latency (up to `intervalMs`) and a full listing per scan.
+- **Two layers against duplicates:**
+  1. The snapshot. A file version that was already seen produces no event, and enqueueing plus updating the snapshot happen in one transaction.
+  2. The inbox idempotency key (`listener:<id>:<event>:<path>:<mtime>`). Even if the snapshot is lost, the same file version can't create a second task.
+- **New files only, by default.** Files present at registration are recorded as already seen. Pass `includeExisting` to process them anyway.
+- **Settling.** Files modified within the last `settleMs` are skipped until a later scan, so a half-written file from an outside writer isn't processed. Files ending in `*.tmp` (the platform's own in-progress writes) are always ignored.
+- **Permissions.** A listener reveals file names and contents to its target, so registering one requires the target agent to have read access to the directory. Access is checked again on every scan: if the grant is revoked, or the agent is deleted or the listener paused, it stops firing and records `lastError`. A paused listener catches up on resume, because the snapshot wasn't advanced while it was paused.
+- **Payload templates.** `{{path}}`, `{{name}}`, `{{event}}`, and `{{listenerId}}` in string values are filled in, so a listener can enqueue a ready-to-run task (for example, `{ action: "transform", from: "{{path}}", to: "~/processed/{{name}}" }`).
+
 ## Trade-offs and limitations
 
 - **Not a sandbox.** `fork()` gives a separate process, not a security boundary. Runtimes are trusted code.
@@ -123,4 +146,7 @@ and another reason real isolation belongs in the OS.
 - **Permanent errors are retried.** A task that fails with `EACCES` is retried like any other error. There's no distinction yet between retryable and permanent failures.
 - **No file locking or versioning.** Atomic rename only; concurrent writers overwrite each other.
 - **Text files only** (UTF-8 strings over IPC), with no size limits.
+- **Listeners are registered by the platform only.** Agents can't create their own listeners over IPC yet.
+- **Listeners only watch files.** No timers or schedules, no agent-to-agent events, and deletes aren't reported. Change detection uses mtime + size, so a rewrite that keeps both the same is missed.
+- **Scans cost O(files) each pass,** which is fine for a toy and expensive for big trees. `fs.watch` could later serve as a "scan now" hint on top of the snapshot model.
 - **Runtimes run via `tsx`** (`--import tsx`) to keep dev simple; no build step.

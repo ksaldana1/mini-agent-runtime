@@ -1,4 +1,4 @@
-import { mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, join, posix } from "node:path";
 import type { Db } from "./database.js";
@@ -20,6 +20,12 @@ export interface Grant {
   access: Access;
   grantedBy: string | null; // null = platform
   createdAt: string;
+}
+
+export interface FileStat {
+  path: string; // logical
+  mtimeMs: number;
+  size: number;
 }
 
 export interface AuditEntry {
@@ -167,6 +173,49 @@ export class AgentFilesystem {
     return `agents/${agentId}`;
   }
 
+  /**
+   * Would `agentId` be allowed `need` access to `rawPath`? Pure check: no audit entry,
+   * no file operation. Used by services that act on an agent's behalf (listeners).
+   */
+  check(agentId: string, rawPath: string, need: Access): { allowed: boolean; reason: string; path: string } {
+    try {
+      const path = this.normalize(agentId, rawPath);
+      return { ...this.decide(agentId, path, need), path };
+    } catch (err) {
+      return { allowed: false, reason: (err as Error).message, path: rawPath };
+    }
+  }
+
+  /**
+   * Platform-privileged recursive listing of regular files under a logical directory.
+   * No authorization: callers must check access themselves. Skips in-progress atomic
+   * writes (*.tmp) and anything that isn't a regular file (including symlinks).
+   */
+  scan(logicalDir: string): FileStat[] {
+    const dir = this.normalize("", logicalDir);
+    const base = this.physical(dir);
+    let entries;
+    try {
+      entries = readdirSync(base, { recursive: true, withFileTypes: true });
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw e;
+    }
+    const out: FileStat[] = [];
+    for (const e of entries) {
+      if (!e.isFile() || e.name.endsWith(".tmp")) continue;
+      const abs = join(e.parentPath, e.name);
+      const rel = abs.slice(base.length + 1).split(/[\\/]/).join("/");
+      try {
+        const st = statSync(abs);
+        out.push({ path: `${dir}/${rel}`, mtimeMs: st.mtimeMs, size: st.size });
+      } catch {
+        // Deleted between readdir and stat: it just doesn't exist for this scan.
+      }
+    }
+    return out.sort((a, b) => a.path.localeCompare(b.path));
+  }
+
   // ── Authorization ─────────────────────────────────────────────────────────
 
   /** Owner of a logical path: the agent whose private dir contains it, or null (platform). */
@@ -175,11 +224,9 @@ export class AgentFilesystem {
     return m ? m[1]! : null;
   }
 
-  private authorize(agentId: string, op: string, path: string, need: Access): void {
-    if (this.owner(path) === agentId) {
-      this.audit(agentId, op, path, true, "owner");
-      return;
-    }
+  /** The permission decision itself, on an already-normalized path. */
+  private decide(agentId: string, path: string, need: Access): { allowed: boolean; reason: string } {
+    if (this.owner(path) === agentId) return { allowed: true, reason: "owner" };
     // Most specific grant covering this path (exact match or an ancestor directory).
     const grant = this.db
       .prepare(
@@ -190,12 +237,15 @@ export class AgentFilesystem {
       .get(agentId, path, path) as { path: string; access: Access } | undefined;
 
     if (grant && (need === "read" || grant.access === "write")) {
-      this.audit(agentId, op, path, true, `grant ${grant.access} on ${grant.path}`);
-      return;
+      return { allowed: true, reason: `grant ${grant.access} on ${grant.path}` };
     }
-    const reason = grant ? `grant on ${grant.path} is ${grant.access}-only` : "no grant";
-    this.audit(agentId, op, path, false, reason);
-    throw new FsDeniedError(`${op} ${path}: ${reason}`, true);
+    return { allowed: false, reason: grant ? `grant on ${grant.path} is ${grant.access}-only` : "no grant" };
+  }
+
+  private authorize(agentId: string, op: string, path: string, need: Access): void {
+    const { allowed, reason } = this.decide(agentId, path, need);
+    this.audit(agentId, op, path, allowed, reason);
+    if (!allowed) throw new FsDeniedError(`${op} ${path}: ${reason}`, true);
   }
 
   /** Agents may only share what they own. Shared areas are granted by the platform. */

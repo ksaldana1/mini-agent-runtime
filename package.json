@@ -6,6 +6,7 @@
     "demo:lifecycle": "tsx src/demos/lifecycle.ts",
     "demo:inbox": "tsx src/demos/inbox.ts",
     "demo:fs": "tsx src/demos/filesystem.ts",
+    "demo:listeners": "tsx src/demos/listeners.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
