@@ -38,6 +38,8 @@ export const AgentMessageSchema = z.discriminatedUnion("type", [
     ok: z.boolean(),
     result: z.unknown().optional(),
     error: z.string().optional(),
+    /** Machine-readable error code, e.g. "EACCES" for a permission denial. */
+    code: z.string().optional(),
   }),
   // First message a runtime receives: tells the process which logical agent it is.
   z.object({
@@ -93,6 +95,8 @@ export const AgentResponseSchema = z.discriminatedUnion("type", [
     message: z.string(),
     // Correlation id (taskId / requestId) when the error relates to a specific request.
     correlationId: z.string().optional(),
+    // false = retrying can't help (bad input, permission denied): fail the task now.
+    retryable: z.boolean().optional(), // absent = true
   }),
 ]);
 export type AgentResponse = z.infer<typeof AgentResponseSchema>;

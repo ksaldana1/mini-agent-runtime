@@ -13,6 +13,7 @@ import { Supervisor } from "../platform/supervisor.js";
 const db = openDatabase("data/platform.db");
 const registry = new AgentRegistry(db);
 const supervisor = new Supervisor(db, registry, { inheritStdio: true });
+supervisor.recover(); // close out runtime records left open by a previous run
 
 supervisor.on("runtime-exit", (r) =>
   console.log(`[supervisor] runtime exit: incarnation #${r.incarnation} pid=${r.pid} → ${r.state}`),

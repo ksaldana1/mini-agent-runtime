@@ -26,9 +26,14 @@ function boot() {
   const inbox = new Inbox(db, registry);
   const supervisor = new Supervisor(db, registry, { fsHandler: (id, req) => fs.handle(id, req) });
   const dispatcher = new Dispatcher(supervisor, inbox);
-  const workflows = new WorkflowService(db, registry, inbox, dispatcher);
+  const workflows = new WorkflowService(db, registry, inbox);
   workflows.on("transition", (e) => console.log(`   [workflow] ${e.event.padEnd(18)} ${e.detail}`));
   supervisor.on("runtime-exit", (r) => console.log(`   [supervisor] ${registry.get(r.agentId)?.name}#${r.incarnation} → ${r.state}`));
+  // Startup recovery, explicitly: close stale runtime records, release stale claims,
+  // then let workflows catch up on anything that settled while nobody was listening.
+  supervisor.recover();
+  dispatcher.recover();
+  workflows.recover();
   return { db, registry, fs, inbox, supervisor, dispatcher, workflows };
 }
 

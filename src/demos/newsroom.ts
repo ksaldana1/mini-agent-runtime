@@ -4,7 +4,7 @@
  *   npm run demo:newsroom
  *
  *   submissions/ ──listener──▶ intake ──(glue)──▶ workflow per article:
- *                                                  edit    (editor; crashes once, auto-restarted)
+ *                                                  edit    (editor; crashes once, restarted by policy)
  *                                                  share   (editor grants senior reviewer read)
  *                                                  review  (junior first: denied → reassigned to senior)
  *
@@ -30,8 +30,11 @@ const fs = new AgentFilesystem(db, registry, "data");
 const inbox = new Inbox(db, registry);
 const supervisor = new Supervisor(db, registry, { fsHandler: (id, req) => fs.handle(id, req) });
 const dispatcher = new Dispatcher(supervisor, inbox);
-const workflows = new WorkflowService(db, registry, inbox, dispatcher);
+const workflows = new WorkflowService(db, registry, inbox);
 const listeners = new ListenerService(db, registry, fs, inbox, { intervalMs: 150, settleMs: 50 });
+supervisor.recover();
+dispatcher.recover();
+workflows.recover();
 
 // ── Logging ─────────────────────────────────────────────────────────────────
 
@@ -43,6 +46,7 @@ const log = (who: string, msg: string) => console.log(`+${((Date.now() - t0) / 1
 
 supervisor.on("runtime-ready", (r) => log("supervisor", `${nameOf(r.agentId)} up (incarnation #${r.incarnation}, pid ${r.pid})`));
 supervisor.on("runtime-exit", (r) => log("supervisor", `${nameOf(r.agentId)} #${r.incarnation} ${r.state}`));
+supervisor.on("restart-scheduled", (e) => log("supervisor", `restarting ${nameOf(e.agentId)} in ${e.delayMs}ms (policy)`));
 listeners.on("fired", ({ path }) => log("listener", `new submission ${posix.basename(path)} → intake inbox`));
 dispatcher.on("released", ({ agentId, count }) => log("inbox", `${count} claim(s) from dead ${nameOf(agentId)} back to pending`));
 workflows.on("transition", (e) => {
@@ -55,13 +59,6 @@ workflows.on("transition", (e) => {
   log("workflow", `[${doc.name}] ${e.event}${detail ? `: ${detail}` : ""}`);
 });
 
-// ── Supervision policy (a preview of a future platform feature) ────────────
-
-let shuttingDown = false;
-supervisor.on("runtime-exit", (r) => {
-  if (r.state === "crashed" && !shuttingDown) setTimeout(() => supervisor.start(r.agentId), 300);
-});
-
 // ── Cast ────────────────────────────────────────────────────────────────────
 
 const agent = (role: string): Agent => registry.create(`${role}-${run}`);
@@ -69,6 +66,8 @@ const intake = agent("intake");
 const editor = agent("editor");
 const junior = agent("junior-reviewer");
 const senior = agent("senior-reviewer");
+// Erlang-style supervision: crashed runtimes come back on their own.
+for (const a of [intake, editor, junior, senior]) supervisor.setPolicy(a.id, { restart: "on-crash", backoffMs: 300 });
 
 const submissions = `shared/documents/submissions-${run}`;
 const desk = `shared/artifacts/desk-${run}`;
@@ -186,8 +185,7 @@ try {
     }),
   );
 } finally {
-  shuttingDown = true;
   listeners.stop();
-  await supervisor.stopAll();
+  await supervisor.close();
   db.close();
 }

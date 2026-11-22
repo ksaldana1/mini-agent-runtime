@@ -5,6 +5,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openDatabase, type Db } from "../src/platform/database.js";
 import { Dispatcher } from "../src/platform/dispatcher.js";
+import { AgentFilesystem } from "../src/platform/filesystem.js";
 import { AgentRegistry, type Agent } from "../src/platform/identity.js";
 import { Inbox } from "../src/platform/inbox.js";
 import { Supervisor } from "../src/platform/supervisor.js";
@@ -86,6 +87,45 @@ describe("Dispatcher: push delivery from inbox to runtimes", () => {
     await until(() => inbox.get(item.id)?.status === "failed");
     expect(inbox.get(item.id)).toMatchObject({ attempts: 3, lastError: expect.stringMatching(/asked to fail/) });
   });
+
+  it("fails a task with an invalid payload after one attempt (non-retryable)", async () => {
+    await supervisor.start(agent.id);
+    const events: { retryable: boolean; willRetry: boolean }[] = [];
+    dispatcher.on("failed", (e) => events.push(e));
+    const item = inbox.send(agent.id, { action: "transform", from: 42 });
+    await until(() => inbox.get(item.id)?.status === "failed");
+    expect(inbox.get(item.id)).toMatchObject({ attempts: 1, lastError: expect.stringMatching(/invalid task payload/) });
+    expect(events).toMatchObject([{ retryable: false, willRetry: false }]);
+  });
+});
+
+describe("Dispatcher: permission denials are permanent", () => {
+  let root: string;
+  let db: Db;
+  let supervisor: Supervisor;
+
+  beforeEach(() => (root = mkdtempSync(join(tmpdir(), "dispatch-fs-"))));
+  afterEach(async () => {
+    await supervisor.stopAll();
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("an EACCES from the filesystem fails the task after one attempt", async () => {
+    db = openDatabase(":memory:");
+    const registry = new AgentRegistry(db);
+    const fs = new AgentFilesystem(db, registry, root);
+    const inbox = new Inbox(db, registry);
+    supervisor = new Supervisor(db, registry, { fsHandler: (id, req) => fs.handle(id, req) });
+    new Dispatcher(supervisor, inbox);
+    const agent = registry.create("snoop");
+
+    await supervisor.start(agent.id);
+    const item = inbox.send(agent.id, { action: "fs", request: { op: "read", path: "shared/documents/secret.txt" } });
+    await until(() => inbox.get(item.id)?.status === "failed");
+    expect(inbox.get(item.id)).toMatchObject({ attempts: 1, lastError: expect.stringMatching(/EACCES/) });
+    expect(fs.auditLog(agent.id).filter((e) => !e.allowed)).toHaveLength(1);
+  });
 });
 
 describe("Platform restart recovery", () => {
@@ -116,12 +156,22 @@ describe("Platform restart recovery", () => {
     const inbox2 = new Inbox(db2, reg2);
     const dispatcher = new Dispatcher(supervisor, inbox2);
 
-    expect(dispatcher.recoveredOnStartup).toBe(1);
+    // Constructors don't recover anything; recovery is explicit.
+    expect(supervisor.history(agent.id)[0]).toMatchObject({ exitSignal: null, exitedAt: null });
+    expect(inbox2.get(item.id)!.status).toBe("claimed");
+
+    expect(supervisor.recover()).toBe(1);
+    expect(dispatcher.recover()).toBe(1);
+    expect(supervisor.recover()).toBe(0); // idempotent
+    expect(dispatcher.recover()).toBe(0);
     expect(supervisor.history(agent.id)[0]).toMatchObject({ exitSignal: "PLATFORM_RESTART" });
 
     const rt = await supervisor.start(agent.id);
     expect(rt.incarnation).toBe(2);
     await until(() => inbox2.get(item.id)?.status === "completed");
+    // A live runtime of this process is not "recovered".
+    expect(supervisor.recover()).toBe(0);
+    expect(supervisor.history(agent.id)[1]).toMatchObject({ exitedAt: null });
 
     await supervisor.stopAll();
     db2.close();

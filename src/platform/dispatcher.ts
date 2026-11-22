@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import type { Inbox, InboxItem } from "./inbox.js";
-import type { Supervisor } from "./supervisor.js";
+import { TaskError, type Supervisor } from "./supervisor.js";
 
 interface InFlight {
   itemId: string;
@@ -25,16 +25,12 @@ interface InFlight {
  */
 export class Dispatcher extends EventEmitter {
   private readonly inFlight = new Map<string, InFlight>();
-  /** Claims left over from a previous platform process, returned to pending at startup. */
-  readonly recoveredOnStartup: number;
 
   constructor(
     private readonly supervisor: Supervisor,
     private readonly inbox: Inbox,
   ) {
     super();
-    // Constructed at platform startup, before any runtime exists: every claim is stale.
-    this.recoveredOnStartup = inbox.releaseAllClaims();
 
     supervisor.on("runtime-ready", ({ agentId }) => this.pump(agentId));
     supervisor.on("runtime-exit", ({ agentId, incarnation }) => {
@@ -43,6 +39,16 @@ export class Dispatcher extends EventEmitter {
       if (count > 0) this.emit("released", { agentId, incarnation, count });
     });
     inbox.on("enqueued", (item: InboxItem) => this.pump(item.recipientAgentId));
+  }
+
+  /**
+   * Platform startup: no runtime from a previous platform process survives, so every
+   * claim in the inbox is stale. Returns them to pending (or failed, if out of attempts).
+   * Must run before this dispatcher delivers anything. Returns how many were released.
+   */
+  recover(): number {
+    if (this.inFlight.size > 0) throw new Error("dispatcher.recover() must run before any delivery");
+    return this.inbox.releaseAllClaims();
   }
 
   /** True when the agent has nothing pending or in flight. */
@@ -72,9 +78,11 @@ export class Dispatcher extends EventEmitter {
           const now = this.supervisor.status(agentId);
           if (now?.state === "running" && now.incarnation === slot.incarnation) {
             // Runtime is alive and answered with an error (or timed out): count it as a failed attempt.
-            this.inbox.fail(item.id, slot.incarnation, err.message);
+            // Timeouts and other non-TaskErrors are assumed transient.
+            const retryable = !(err instanceof TaskError) || err.retryable;
+            this.inbox.fail(item.id, slot.incarnation, err.message, { retryable });
             const willRetry = this.inbox.get(item.id)?.status === "pending";
-            this.emit("failed", { item, error: err.message, willRetry });
+            this.emit("failed", { item, error: err.message, retryable, willRetry });
           }
           // Otherwise the runtime died; the runtime-exit handler already released the claim.
         },

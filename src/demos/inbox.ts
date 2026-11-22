@@ -47,7 +47,9 @@ const counts = (agentId: string) => {
 };
 
 try {
-  if (dispatcher.recoveredOnStartup) console.log(`(recovered ${dispatcher.recoveredOnStartup} stale claim(s) from a previous run)`);
+  supervisor.recover();
+  const recovered = dispatcher.recover();
+  if (recovered) console.log(`(recovered ${recovered} stale claim(s) from a previous run)`);
 
   // Fresh agent each run so the numbers are easy to follow.
   const agent = registry.create(`inbox-demo-${Date.now()}`);

@@ -98,28 +98,6 @@ export class ListenerService extends EventEmitter {
     super();
     this.intervalMs = opts.intervalMs ?? 1_000;
     this.settleMs = opts.settleMs ?? 100;
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS listeners (
-        id               TEXT PRIMARY KEY,
-        target_agent_id  TEXT NOT NULL REFERENCES agents(id),
-        path             TEXT NOT NULL,
-        events           TEXT NOT NULL,
-        payload_template TEXT,
-        state            TEXT NOT NULL,
-        created_at       TEXT NOT NULL,
-        last_scan_at     TEXT,
-        last_error       TEXT
-      );
-      -- What each listener has already seen. Survives platform restarts, which is
-      -- how files created while the platform was down still get noticed.
-      CREATE TABLE IF NOT EXISTS listener_files (
-        listener_id TEXT NOT NULL REFERENCES listeners(id) ON DELETE CASCADE,
-        path        TEXT NOT NULL,
-        mtime_ms    REAL NOT NULL,
-        size        INTEGER NOT NULL,
-        PRIMARY KEY (listener_id, path)
-      );
-    `);
   }
 
   // ── Registration ─────────────────────────────────────────────────────────

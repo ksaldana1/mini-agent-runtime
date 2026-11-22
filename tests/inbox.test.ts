@@ -2,9 +2,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { openDatabase } from "../src/platform/database.js";
+import { openDatabase, type Db } from "../src/platform/database.js";
 import { AgentRegistry, type Agent } from "../src/platform/identity.js";
-import { Inbox } from "../src/platform/inbox.js";
+import { Inbox, type InboxItem } from "../src/platform/inbox.js";
 
 describe("Inbox (storage, no processes)", () => {
   let registry: AgentRegistry;
@@ -115,5 +115,106 @@ describe("Inbox durability", () => {
     expect(inbox2.releaseAllClaims()).toBe(2);
     expect(inbox2.get(claimed.id)!.status).toBe("pending");
     db2.close();
+  });
+});
+
+describe("Inbox settlement", () => {
+  let db: Db;
+  let registry: AgentRegistry;
+  let inbox: Inbox;
+  let a: Agent;
+  let settled: InboxItem[];
+
+  beforeEach(() => {
+    db = openDatabase(":memory:");
+    registry = new AgentRegistry(db);
+    inbox = new Inbox(db, registry, { maxAttempts: 2 });
+    a = registry.create("a");
+    settled = [];
+    inbox.on("settled", (item: InboxItem) => settled.push(item));
+  });
+
+  const tick = () => new Promise<void>((r) => setImmediate(r));
+
+  it("complete emits settled (after the call returns, not synchronously)", async () => {
+    const item = inbox.send(a.id, {});
+    inbox.claimNext(a.id, 1);
+    inbox.complete(item.id, 1, { ok: true });
+    expect(settled).toHaveLength(0);
+    await tick();
+    expect(settled).toMatchObject([{ id: item.id, status: "completed", result: { ok: true } }]);
+  });
+
+  it("fail emits settled only when attempts run out", async () => {
+    const item = inbox.send(a.id, {});
+    inbox.claimNext(a.id, 1);
+    inbox.fail(item.id, 1, "boom");
+    await tick();
+    expect(settled).toHaveLength(0); // back to pending: not final
+    inbox.claimNext(a.id, 1);
+    inbox.fail(item.id, 1, "boom again");
+    await tick();
+    expect(settled).toMatchObject([{ id: item.id, status: "failed", attempts: 2, lastError: "boom again" }]);
+  });
+
+  it("releaseClaims emits settled for each item it marks failed", async () => {
+    const item = inbox.send(a.id, {});
+    inbox.claimNext(a.id, 1);
+    inbox.releaseClaims(a.id, 1); // attempt 1 of 2: back to pending
+    await tick();
+    expect(settled).toHaveLength(0);
+    inbox.claimNext(a.id, 2);
+    inbox.releaseClaims(a.id, 2);
+    await tick();
+    expect(settled).toMatchObject([{ id: item.id, status: "failed", lastError: "runtime exited while processing" }]);
+  });
+
+  it("releaseAllClaims emits settled for each item it marks failed", async () => {
+    const exhausted = inbox.send(a.id, "x");
+    const fresh = inbox.send(a.id, "y");
+    inbox.claimNext(a.id, 1);
+    inbox.fail(exhausted.id, 1, "boom");
+    inbox.claimNext(a.id, 1); // FIFO: "x" again, its last attempt (2 of 2)
+    inbox.claimNext(a.id, 1); // "y", attempt 1 of 2
+    expect(inbox.releaseAllClaims()).toBe(2);
+    await tick();
+    expect(settled.map((i) => [i.id, i.status])).toEqual([[exhausted.id, "failed"]]);
+    expect(inbox.get(fresh.id)!.status).toBe("pending");
+  });
+
+  it("a non-retryable failure marks the item failed on the first attempt", async () => {
+    const item = inbox.send(a.id, {});
+    inbox.claimNext(a.id, 1);
+    expect(inbox.fail(item.id, 1, "EACCES: nope", { retryable: false })).toBe(true);
+    expect(inbox.get(item.id)).toMatchObject({ status: "failed", attempts: 1, lastError: "EACCES: nope" });
+    await tick();
+    expect(settled).toMatchObject([{ id: item.id, status: "failed" }]);
+  });
+
+  it("waitFor resolves right away for an already-settled item", async () => {
+    const item = inbox.send(a.id, {});
+    inbox.claimNext(a.id, 1);
+    inbox.complete(item.id, 1, 42);
+    // Fresh Inbox instance (like a new platform process): no event will ever fire.
+    const other = new Inbox(db, registry);
+    await expect(other.waitFor(item.id)).resolves.toMatchObject({ status: "completed", result: 42 });
+  });
+
+  it("waitFor waits for settlement, ignoring non-final transitions", async () => {
+    const item = inbox.send(a.id, {});
+    let done: InboxItem | undefined;
+    void inbox.waitFor(item.id).then((i) => (done = i));
+    inbox.claimNext(a.id, 1);
+    inbox.fail(item.id, 1, "transient");
+    await tick();
+    expect(done).toBeUndefined();
+    inbox.claimNext(a.id, 1);
+    inbox.complete(item.id, 1, "ok");
+    await tick();
+    expect(done).toMatchObject({ status: "completed", result: "ok" });
+  });
+
+  it("waitFor rejects for an unknown item", async () => {
+    await expect(inbox.waitFor("nope")).rejects.toThrow(/unknown inbox item/);
   });
 });

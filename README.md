@@ -42,10 +42,10 @@ reloads Agent A from `data/platform.db` and continues its incarnation count.
 | File | Role |
 |---|---|
 | `src/shared/protocol.ts` | Zod schemas for `AgentMessage` (platform→runtime) and `AgentResponse` (runtime→platform). Both sides validate on receipt. |
-| `src/platform/database.ts` | SQLite setup: `agents`, `runtimes`, and `inbox` tables (`fs_grants` / `fs_audit` are created by the filesystem service). |
+| `src/platform/database.ts` | SQLite setup and the whole schema, as ordered migrations tracked by `PRAGMA user_version`. |
 | `src/platform/identity.ts` | `AgentRegistry`: create / look up agents. Knows nothing about processes. |
-| `src/platform/supervisor.ts` | Forks runtimes, does the INIT/READY handshake, correlates requests to responses, detects exits, records every incarnation. |
-| `src/platform/inbox.ts` | Durable inbox: `pending → claimed → completed / failed`. Idempotency keys, claims fenced by incarnation, retry limit. Pure SQLite, no processes. |
+| `src/platform/supervisor.ts` | Forks runtimes, does the INIT/READY handshake, correlates requests to responses, detects exits, records every incarnation, and restarts crashed runtimes according to a per-agent policy. |
+| `src/platform/inbox.ts` | Durable inbox: `pending → claimed → completed / failed`. Idempotency keys, claims fenced by incarnation, retry limit, `"settled"` events and `waitFor`. Pure SQLite, no processes. |
 | `src/platform/dispatcher.ts` | Push delivery. Hands the oldest pending item to a running, idle runtime; releases claims when a runtime exits. |
 | `src/platform/filesystem.ts` | Platform-checked file access: path normalization, ownership + grants, audit log, atomic writes. |
 | `src/platform/listeners.ts` | Persistent subscriptions. Periodically scans watched directories against a saved snapshot and enqueues inbox items for new or changed files. |
@@ -61,6 +61,16 @@ reloads Agent A from `data/platform.db` and continues its incarnation count.
 The runtime is told its identity via an `INIT` IPC message rather than argv/env, so identity
 assignment is part of the validated protocol and the supervisor can verify the `READY` echo.
 
+### Supervision
+
+`supervisor.setPolicy(agentId, { restart: "on-crash", maxRestarts, windowMs, backoffMs, maxBackoffMs })`
+gives an agent Erlang-style one-for-one supervision. Policies are in memory: code supplies them on every boot.
+
+- **Only crashes are restarted.** A runtime that exits because of `stop()` or `close()` is never restarted, even if it had to be `SIGKILL`ed.
+- **Exponential backoff.** The first restart within a window waits `backoffMs`, the next one twice as long, and so on, up to `maxBackoffMs`.
+- **Restart cap.** More than `maxRestarts` crashes within `windowMs` leaves the runtime in the `given-up` state and emits `"gave-up"`. A manual `start()` clears it.
+- `stop()` cancels a pending restart. `close()` cancels all of them and refuses further starts.
+
 ### Inbox vs transport
 
 The **inbox** (`inbox.ts`) is durable storage that answers "what does this agent owe / is owed?".
@@ -72,7 +82,9 @@ Delivery is **at-least-once**:
 - Each claim records the incarnation holding it. When that incarnation exits, its claims go back to `pending` and are redelivered to the next one (same `taskId`).
 - `complete` / `fail` only apply if the caller's incarnation still holds the claim, so a late reply from a dead process can't overwrite a redelivery (a fencing token).
 - `attempts` counts deliveries. After `maxAttempts` (default 3), an item that keeps erroring **or keeps crashing its runtime** is marked `failed` instead of looping forever.
-- On platform startup, every `claimed` item is released (no runtime from the old platform process survives) and open `runtimes` rows are closed with `PLATFORM_RESTART`.
+- **Permanent errors skip the retries.** A runtime's `ERROR` carries `retryable` (default `true`). Invalid task payloads and permission denials (`EACCES`) are sent as `retryable: false`, and the inbox marks the item `failed` on that attempt. Timeouts and crashes are always treated as retryable.
+- **Settlement.** Whenever an item reaches `completed` or `failed`, by any path (`complete`, `fail`, or a crash/startup release), the inbox emits `"settled"` after the write commits. `inbox.waitFor(id)` resolves once the item has settled, immediately if it already has. This replaces polling.
+- **Recovery is explicit** (`supervisor.recover()`, `dispatcher.recover()`, `workflows.recover()`), not done in constructors, so code can register things before recovery runs. On startup, every `claimed` item is released (no runtime from the old platform process survives) and open `runtimes` rows are closed with `PLATFORM_RESTART`.
 - Senders can pass an `idempotencyKey`; a repeat send to the same recipient returns the original item.
 
 Because delivery can repeat, agents should treat `taskId` as an idempotency key for side effects.
@@ -148,14 +160,14 @@ step's result), and `{{workflow.id}}`.
 
 ```text
 WorkflowService ──inbox.send──▶ Inbox ──Dispatcher──▶ runtime
-      ▲                                    │
-      └──── "completed" / "failed" / "released" events
-      └──── reconcileAll() at startup (recovery)
+      ▲                           │
+      └──── "settled" events ─────┘
+      └──── recover() at startup (reconcileAll)
 ```
 
 - **Workflows sit on top of the inbox.** A workflow never talks to a runtime. Assigning a step means `inbox.send` with the idempotency key `workflow:<id>:step:<n>:assignment:<k>`. Delivery, crash redelivery, and retry limits all come from the inbox and dispatcher.
 - **Progress comes from stored state.** `reconcile()` looks at the current step's inbox item. If it's `completed`, the result is saved and the next step is assigned (or the workflow completes). If it's `failed`, the step goes to the next candidate agent (or the workflow fails). If it's pending or claimed, nothing happens. Because it only reads the database, calling it repeatedly is safe, and each transition runs in one transaction.
-- **Events for speed, a startup pass for recovery.** Dispatcher events trigger `reconcile` immediately. On startup, `reconcileAll()` catches anything that finished while no service was listening.
+- **Events for speed, a startup pass for recovery.** The inbox's `"settled"` event triggers `reconcile` immediately, including when a crash release is what failed the item. On startup, `recover()` catches anything that finished while no service was listening.
 - **Two levels of retry:** retrying *the same agent* (crash or error, up to `maxAttempts`) is the inbox's job. Moving work *to a different agent* is the workflow's job.
 - **Workflow state stays separate from agent state.** Agents don't know they are part of a workflow; they just get tasks. All progress lives in `workflows`, `workflow_steps`, and `workflow_events` (an append-only list of transitions).
 

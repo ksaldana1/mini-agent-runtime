@@ -16,6 +16,7 @@ const db = openDatabase("data/platform.db");
 const registry = new AgentRegistry(db);
 const fs = new AgentFilesystem(db, registry, "data");
 const supervisor = new Supervisor(db, registry, { fsHandler: (agentId, req) => fs.handle(agentId, req) });
+supervisor.recover();
 
 const run = Date.now();
 const alice = registry.create(`alice-${run}`);

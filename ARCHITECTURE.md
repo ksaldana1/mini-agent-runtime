@@ -562,11 +562,10 @@ All five milestones are implemented (see README). This section records what the 
 - Sender identity is validated, but nothing restricts which agents may send to which.
 
 **Lifecycle**
-- The supervisor detects crashes but never restarts agents itself. Restarting is the caller's job.
+- Restart policies live in memory and must be set again on every boot. Crash counts for the restart window are not persisted either.
 - Stopping an agent doesn't wait for its in-flight task. The task is redelivered, and that delivery counts as an attempt.
 
 **Inbox and delivery**
-- Permanent errors (for example `EACCES`) are retried like temporary ones, using up all attempts before giving up.
 - `failed` items just stay in the inbox with their last error. There is no separate dead-letter handling.
 - Delivery is strictly first-in, first-out per agent, with no priorities.
 - Only the platform can call `inbox.send`. Agents can't send messages over IPC.
@@ -591,8 +590,7 @@ All five milestones are implemented (see README). This section records what the 
 
 ### Next Steps
 
-1. **Supervisor restart policies.** Restart crashed runtimes automatically, Erlang-style (for example, one-for-one restarts with backoff and a cap on restarts within a time window).
-2. **Separate permanent from temporary errors.** Let a task report an error as non-retryable so the inbox fails it right away, and a workflow can reassign it without spending all attempts.
-3. **Step deadlines.** Give each workflow step a timeout that triggers reassignment to the next candidate agent, so a step held by an agent that never runs doesn't block the workflow.
-4. **Agent-initiated messaging and listeners.** Add IPC messages that let runtimes send inbox messages and register listeners, with a check on who may send to whom.
-5. **OS-enforced isolation.** Give each agent its own Unix user (or namespace/container), and turn platform grants into real file ownership, POSIX permissions, or ACLs, so the kernel enforces access instead of TypeScript.
+1. **Library API.** In progress; see [LIBRARY_PLAN.md](LIBRARY_PLAN.md). Phase 0 (migrations, settlement events, permanent errors, explicit recovery, restart policies) is done.
+2. **Step deadlines.** Give each workflow step a timeout that triggers reassignment to the next candidate agent, so a step held by an agent that never runs doesn't block the workflow.
+3. **Agent-initiated messaging and listeners.** Add IPC messages that let runtimes send inbox messages and register listeners, with a check on who may send to whom.
+4. **OS-enforced isolation.** Give each agent its own Unix user (or namespace/container), and turn platform grants into real file ownership, POSIX permissions, or ACLs, so the kernel enforces access instead of TypeScript.

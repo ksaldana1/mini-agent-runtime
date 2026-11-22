@@ -21,6 +21,8 @@ const fs = new AgentFilesystem(db, registry, "data");
 const inbox = new Inbox(db, registry);
 const supervisor = new Supervisor(db, registry, { fsHandler: (id, req) => fs.handle(id, req) });
 const dispatcher = new Dispatcher(supervisor, inbox);
+supervisor.recover();
+dispatcher.recover();
 
 const LISTENER_OPTS = { intervalMs: 200, settleMs: 50 };
 const makeListeners = () => {

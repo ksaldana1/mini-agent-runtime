@@ -1,7 +1,7 @@
 # Library-ification Plan
 
-> **Status (2026-11-22):** plan and all design decisions (D1–D8) approved. Implementation not started.
-> Start at **Phase 0**. Read [Handoff notes](#handoff-notes-for-a-fresh-session) first.
+> **Status (2026-11-22):** plan and all design decisions (D1–D8) approved. **Phase 0 done, awaiting review.**
+> Next: **Phase 1**. Read [Handoff notes](#handoff-notes-for-a-fresh-session) first.
 
 Turn the platform from "seven classes you wire by hand" into a small library with a typed,
 awaitable API. The current classes in `src/platform/` stay as the internal **kernel**. The new
@@ -77,28 +77,28 @@ These shape every phase. **All decisions below were approved on 2026-11-22. Trea
 
 These are internal changes that the later phases depend on. Every existing test and demo must still pass after each step.
 
-### ☐ 0.1 Schema migrations · S
+### ☑ 0.1 Schema migrations · S
 - `database.ts`: replace the one big `CREATE … IF NOT EXISTS` block with an ordered list of migrations applied according to `PRAGMA user_version`. Move the tables that services create themselves (`fs_*`, `listeners`, `workflow_*`) into that list, so the whole schema lives in one place.
 - **Done when:** a fresh DB and the existing `data/platform.db` both open cleanly, and a test confirms migrations are idempotent.
 
-### ☐ 0.2 Task settlement events · S
+### ☑ 0.2 Task settlement events · S
 - `Inbox` emits `"settled"` (item, final status) from `complete`, from `fail` when the attempts run out, and from `releaseClaims` / `releaseAllClaims` for each item they mark `failed`. Emitted after commit, like `"enqueued"`.
 - Add `inbox.waitFor(itemId): Promise<InboxItem>`. It reads the DB first and resolves right away if the item has already settled; otherwise it waits for `"settled"`. This is the basis for `TaskHandle.result()`.
 - `WorkflowService` subscribes to `"settled"` instead of the dispatcher's `completed`/`failed`/`released` events. This removes the `reconcileAll()`-on-every-release workaround.
 - **Done when:** there are tests for settlement through each of the three paths, and for `waitFor` on an item that was already settled.
 
-### ☐ 0.3 Permanent vs retryable errors · S
+### ☑ 0.3 Permanent vs retryable errors · S
 - Protocol: `ERROR` gains `retryable: boolean` (default `true`).
 - `Inbox.fail(id, incarnation, error, { retryable })` marks the item `failed` immediately when `retryable` is false. The dispatcher passes the flag through.
 - Runtime: input-validation failures and `EACCES` are non-retryable.
 - **Done when:** in `demo:newsroom`, the junior reviewer's denials take 1 attempt instead of 3. Fixes a known limitation.
 
-### ☐ 0.4 Explicit recovery · S
+### ☑ 0.4 Explicit recovery · S
 - Remove recovery from constructors and add `supervisor.recover()`, `dispatcher.recover()`, and `workflows.recover()`, each returning what it recovered.
 - Update demos and tests to call them. That's temporary; Phase 2's `platform.start()` takes over.
 - **Done when:** the existing restart-recovery tests pass using explicit `recover()` calls.
 
-### ☐ 0.5 Supervisor restart policy · M
+### ☑ 0.5 Supervisor restart policy · M
 - `supervisor.setPolicy(agentId, { restart: "never" | "on-crash", maxRestarts, windowMs, backoffMs })`. Only crashes are restarted, never deliberate stops. Once the cap is hit, the runtime is left in a `given-up` state and an event is emitted.
 - **Done when:** there are tests for a crash being restarted, exponential backoff, the restart cap within a time window, and stop/close not triggering a restart. The newsroom's hand-written restart code can then be deleted. Fixes a known limitation.
 
@@ -245,8 +245,12 @@ Read these before touching code.
 **Read first:** this file, then `ARCHITECTURE.md` (the original brief, plus §10 for known limitations), then `README.md` (how each subsystem works and why). The kernel code is in `src/platform/`. The best end-to-end example is `src/demos/newsroom.ts`.
 
 **Where things stand:**
-- Milestones 1–5 from `ARCHITECTURE.md` are complete: 63 tests passing, `tsc` clean, six demos working (`npm run demo:newsroom` plus one per milestone).
-- Nothing has been committed to git yet. The repo has no commits on `main`. Commit before starting Phase 0, so every phase has a clean diff.
+- Milestones 1–5 from `ARCHITECTURE.md` are complete, and so is Phase 0: 87 tests passing, `tsc` clean, six demos working (`npm run demo:newsroom` plus one per milestone).
+- Phase 0 notes for later phases:
+  - Supervisor events added: `restart-scheduled`, `gave-up`, `restart-failed`. Phase 2.4's `agent.gave-up` maps to `gave-up`.
+  - `TaskError` (in `supervisor.ts`) carries `retryable`. The runtime marks `EACCES` (the `code` field on `FS_RESPONSE`) and invalid toy payloads as permanent. Phase 1.2's host should do the same for unknown tasks and Zod input failures.
+  - `dispatcher.recover()` throws if anything is already in flight, so `platform.start()` must call it before starting agents.
+- Work is committed on `main`; commit at the end of each phase so every phase has a clean diff.
 
 **Environment quirks (macOS, not Linux):**
 - `node` in the user's zsh is an nvm lazy-load shell function that prints nvm's help text. Use `command node`, `command npm`, and `command npx`, which resolve to Node v26 (`~/.vite-plus/bin`). Node v24 is also at `/usr/local/bin`. `.nvmrc` says 26.

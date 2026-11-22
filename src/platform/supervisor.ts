@@ -6,8 +6,35 @@ import type { Db } from "./database.js";
 import type { AgentRegistry } from "./identity.js";
 import { AgentResponseSchema, type AgentMessage, type AgentResponse, type FsRequest } from "../shared/protocol.js";
 
-/** State of one runtime incarnation (a process), not of the logical agent. */
-export type RuntimeState = "starting" | "running" | "stopping" | "exited" | "crashed";
+/**
+ * State of one runtime incarnation (a process), not of the logical agent.
+ * "given-up" = crashed, and the restart policy hit its cap, so nothing will restart it.
+ */
+export type RuntimeState = "starting" | "running" | "stopping" | "exited" | "crashed" | "given-up";
+
+/**
+ * Erlang-style supervision for one agent. Only crashes are restarted, never deliberate
+ * stops. Restarts back off exponentially (backoffMs, 2×, 4×, … capped at maxBackoffMs);
+ * more than `maxRestarts` crashes within `windowMs` and the supervisor gives up.
+ */
+export interface RestartPolicy {
+  restart: "never" | "on-crash";
+  /** Restarts allowed within `windowMs` before giving up. Default 5. */
+  maxRestarts?: number;
+  /** Sliding window for counting crashes. Default 60s. */
+  windowMs?: number;
+  /** Delay before the first restart in a window; doubles per further crash. Default 100ms. */
+  backoffMs?: number;
+  /** Upper bound on the delay. Default 10s. */
+  maxBackoffMs?: number;
+}
+
+interface Supervision {
+  policy: Required<RestartPolicy>;
+  /** Timestamps of recent crashes (pruned to the window). */
+  crashes: number[];
+  timer?: NodeJS.Timeout;
+}
 
 export interface RuntimeInfo {
   agentId: string;
@@ -52,6 +79,16 @@ export interface SupervisorOptions {
   fsHandler?: (agentId: string, request: FsRequest) => unknown;
 }
 
+/** A task the runtime reported as failed. `retryable: false` means retrying can't help. */
+export class TaskError extends Error {
+  constructor(
+    message: string,
+    readonly retryable: boolean,
+  ) {
+    super(message);
+  }
+}
+
 const DEFAULT_ENTRY = fileURLToPath(new URL("../runtime/agent.ts", import.meta.url));
 
 /**
@@ -59,6 +96,9 @@ const DEFAULT_ENTRY = fileURLToPath(new URL("../runtime/agent.ts", import.meta.u
  * (temporary) process currently embodying them. At most one live runtime per agent.
  *
  * Events: "runtime-ready" (RuntimeInfo), "runtime-exit" (RuntimeInfo),
+ *         "restart-scheduled" ({ agentId, attempt, delayMs }),
+ *         "gave-up" ({ agentId, crashes, windowMs }),
+ *         "restart-failed" ({ agentId, error }),
  *         "protocol-error" ({ agentId, error }).
  */
 export class Supervisor extends EventEmitter {
@@ -68,6 +108,8 @@ export class Supervisor extends EventEmitter {
   private readonly stopTimeoutMs: number;
   private readonly inheritStdio: boolean;
   private readonly fsHandler: SupervisorOptions["fsHandler"];
+  private readonly supervision = new Map<string, Supervision>();
+  private closed = false;
 
   constructor(
     private readonly db: Db,
@@ -80,17 +122,57 @@ export class Supervisor extends EventEmitter {
     this.stopTimeoutMs = opts.stopTimeoutMs ?? 2_000;
     this.inheritStdio = opts.inheritStdio ?? false;
     this.fsHandler = opts.fsHandler;
+  }
 
-    // Platform startup: runtimes from a previous platform process exited when their IPC
-    // channel closed, but we never saw it. Close out their records.
-    this.db
-      .prepare(`UPDATE runtimes SET exited_at = ?, exit_signal = 'PLATFORM_RESTART' WHERE exited_at IS NULL`)
-      .run(new Date().toISOString());
+  /**
+   * Platform startup: runtimes from a previous platform process exited when their IPC
+   * channel closed, but nobody recorded it. Close out their records. Runtimes started
+   * by this supervisor are left alone. Returns how many records were closed.
+   */
+  recover(): number {
+    const live = new Set([...this.runtimes.values()].filter((r) => this.isLive(r.agentId)).map((r) => `${r.agentId}#${r.incarnation}`));
+    const open = this.db.prepare(`SELECT agent_id, incarnation FROM runtimes WHERE exited_at IS NULL`).all() as {
+      agent_id: string;
+      incarnation: number;
+    }[];
+    const close = this.db.prepare(
+      `UPDATE runtimes SET exited_at = ?, exit_signal = 'PLATFORM_RESTART' WHERE agent_id = ? AND incarnation = ?`,
+    );
+    let closed = 0;
+    this.db.transaction(() => {
+      for (const r of open) {
+        if (live.has(`${r.agent_id}#${r.incarnation}`)) continue;
+        close.run(new Date().toISOString(), r.agent_id, r.incarnation);
+        closed++;
+      }
+    })();
+    return closed;
   }
 
   // ── Lifecycle ────────────────────────────────────────────────────────────
 
+  /** Set (or replace) the restart policy for an agent. In memory: code supplies it every boot. */
+  setPolicy(agentId: string, policy: RestartPolicy): void {
+    const existing = this.supervision.get(agentId);
+    if (existing?.timer) clearTimeout(existing.timer);
+    this.supervision.set(agentId, {
+      policy: { maxRestarts: 5, windowMs: 60_000, backoffMs: 100, maxBackoffMs: 10_000, ...policy },
+      crashes: existing?.crashes ?? [],
+    });
+  }
+
+  /** Starting by hand cancels a pending automatic restart and clears a "given-up" state. */
   async start(agentId: string): Promise<RuntimeInfo> {
+    const sup = this.supervision.get(agentId);
+    if (sup?.timer) {
+      clearTimeout(sup.timer);
+      sup.timer = undefined;
+    }
+    return this.spawn(agentId);
+  }
+
+  private async spawn(agentId: string): Promise<RuntimeInfo> {
+    if (this.closed) throw new Error("supervisor is closed");
     const agent = this.registry.get(agentId);
     if (!agent) throw new Error(`unknown agent ${agentId}`);
     if (agent.lifecycleState !== "active") throw new Error(`agent ${agentId} is ${agent.lifecycleState}`);
@@ -120,9 +202,13 @@ export class Supervisor extends EventEmitter {
     this.runtimes.set(agentId, runtime);
 
     child.on("message", (raw) => this.onMessage(runtime, raw));
+    // e.g. EPIPE when sending to a process that is already dying. Unhandled, it would
+    // crash the platform; the "exit" handler below deals with the process itself.
+    child.on("error", (error) => this.emit("protocol-error", { agentId, error }));
     child.on("exit", (code, signal) => {
       // A clean exit we asked for is "exited"; anything else is a crash.
-      runtime.state = runtime.state === "stopping" && code === 0 ? "exited" : "crashed";
+      const deliberate = runtime.state === "stopping";
+      runtime.state = deliberate && code === 0 ? "exited" : "crashed";
       this.db
         .prepare(
           `UPDATE runtimes SET exited_at = ?, exit_code = ?, exit_signal = ? WHERE agent_id = ? AND incarnation = ?`,
@@ -135,6 +221,8 @@ export class Supervisor extends EventEmitter {
       runtime.pending.clear();
       markExited();
       this.emit("runtime-exit", this.info(runtime));
+      // Even a stop that ended in SIGKILL was asked for: never restart it.
+      if (!deliberate) this.onCrash(runtime);
     });
 
     // Handshake: hand the anonymous process its identity, wait for it to confirm.
@@ -155,8 +243,16 @@ export class Supervisor extends EventEmitter {
     return info;
   }
 
-  /** Graceful stop: SHUTDOWN over IPC, then SIGKILL if it doesn't exit in time. */
+  /**
+   * Graceful stop: SHUTDOWN over IPC, then SIGKILL if it doesn't exit in time.
+   * Also cancels a pending automatic restart.
+   */
   async stop(agentId: string): Promise<void> {
+    const sup = this.supervision.get(agentId);
+    if (sup?.timer) {
+      clearTimeout(sup.timer);
+      sup.timer = undefined;
+    }
     const runtime = this.runtimes.get(agentId);
     if (!runtime || !this.isLive(agentId)) return;
     runtime.state = "stopping";
@@ -172,7 +268,51 @@ export class Supervisor extends EventEmitter {
   }
 
   async stopAll(): Promise<void> {
+    for (const sup of this.supervision.values()) {
+      clearTimeout(sup.timer);
+      sup.timer = undefined;
+    }
     await Promise.all([...this.runtimes.keys()].map((id) => this.stop(id)));
+  }
+
+  /** Stop everything and refuse further starts, including automatic restarts. */
+  async close(): Promise<void> {
+    this.closed = true;
+    await this.stopAll();
+  }
+
+  // ── Supervision ──────────────────────────────────────────────────────────
+
+  private onCrash(runtime: Runtime): void {
+    const sup = this.supervision.get(runtime.agentId);
+    if (!sup || sup.policy.restart !== "on-crash" || this.closed) return;
+    const { maxRestarts, windowMs, backoffMs, maxBackoffMs } = sup.policy;
+
+    const now = Date.now();
+    sup.crashes = [...sup.crashes.filter((t) => now - t < windowMs), now];
+    if (sup.crashes.length > maxRestarts) {
+      runtime.state = "given-up";
+      this.emit("gave-up", { agentId: runtime.agentId, crashes: sup.crashes.length, windowMs });
+      return;
+    }
+
+    const attempt = sup.crashes.length;
+    const delayMs = Math.min(backoffMs * 2 ** (attempt - 1), maxBackoffMs);
+    this.emit("restart-scheduled", { agentId: runtime.agentId, attempt, delayMs });
+    sup.timer = setTimeout(() => {
+      sup.timer = undefined;
+      this.spawn(runtime.agentId).catch((error: Error) => {
+        // If the new process died, its exit already went through onCrash (and maybe
+        // scheduled the next attempt). Otherwise it never got that far (e.g. the agent
+        // was deleted): retrying won't help.
+        this.emit("restart-failed", { agentId: runtime.agentId, error });
+        const latest = this.runtimes.get(runtime.agentId);
+        if (!sup.timer && latest && !this.isLive(runtime.agentId) && latest.state !== "given-up") {
+          latest.state = "given-up";
+          this.emit("gave-up", { agentId: runtime.agentId, crashes: sup.crashes.length, windowMs });
+        }
+      });
+    }, delayMs);
   }
 
   // ── Observation ──────────────────────────────────────────────────────────
@@ -204,7 +344,7 @@ export class Supervisor extends EventEmitter {
 
   async sendTask(agentId: string, payload: unknown, taskId: string = randomUUID()): Promise<unknown> {
     const res = await this.request(this.running(agentId), taskId, { type: "TASK", taskId, payload });
-    if (res.type === "ERROR") throw new Error(`task ${taskId} failed: ${res.message}`);
+    if (res.type === "ERROR") throw new TaskError(`task ${taskId} failed: ${res.message}`, res.retryable ?? true);
     if (res.type !== "TASK_COMPLETED") throw new Error(`expected TASK_COMPLETED, got ${res.type}`);
     return res.result;
   }
@@ -260,7 +400,8 @@ export class Supervisor extends EventEmitter {
       if (runtime.state !== "running") throw new Error("runtime is not running");
       reply = { type: "FS_RESPONSE", requestId, ok: true, result: this.fsHandler(runtime.agentId, request) };
     } catch (err) {
-      reply = { type: "FS_RESPONSE", requestId, ok: false, error: (err as Error).message };
+      const code = (err as { code?: unknown }).code;
+      reply = { type: "FS_RESPONSE", requestId, ok: false, error: (err as Error).message, ...(typeof code === "string" && { code }) };
     }
     if (runtime.child.connected) this.send(runtime, reply);
   }

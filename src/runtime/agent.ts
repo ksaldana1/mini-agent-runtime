@@ -6,7 +6,8 @@
  * at any moment and replaced by a new incarnation of the same agent.
  */
 import { randomUUID } from "node:crypto";
-import { AgentMessageSchema, type AgentMessage, type AgentResponse, type FsRequest } from "../shared/protocol.js";
+import { z } from "zod";
+import { AgentMessageSchema, FsRequestSchema, type AgentMessage, type AgentResponse, type FsRequest } from "../shared/protocol.js";
 
 if (!process.send) {
   console.error("agent runtime must be started by the supervisor via child_process.fork()");
@@ -33,6 +34,9 @@ function log(text: string): void {
 // ── Platform filesystem client ──────────────────────────────────────────────
 // The runtime never touches node:fs for platform data; it asks the platform.
 
+/** Retrying can't help: the platform should fail the task immediately. */
+class PermanentError extends Error {}
+
 const fsPending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
 
 function platformFs(request: FsRequest): Promise<unknown> {
@@ -53,22 +57,27 @@ function platformFs(request: FsRequest): Promise<unknown> {
  *
  * `delayMs` (simulate slow work) applies to every action.
  */
+const TaskPayloadSchema = z.union([
+  z.object({ action: z.literal("fs"), request: FsRequestSchema, delayMs: z.number().optional() }),
+  z.object({
+    action: z.literal("transform"),
+    from: z.string(),
+    to: z.string(),
+    suffix: z.string().optional(),
+    delayMs: z.number().optional(),
+  }),
+  z.looseObject({ action: z.undefined().optional(), text: z.unknown().optional(), fail: z.unknown().optional(), delayMs: z.number().optional() }),
+]);
+
 async function executeTask(payload: unknown): Promise<unknown> {
-  const p = (typeof payload === "object" && payload !== null ? payload : {}) as {
-    action?: unknown;
-    request?: FsRequest;
-    from?: string;
-    to?: string;
-    suffix?: string;
-    text?: unknown;
-    delayMs?: unknown;
-    fail?: unknown;
-  };
+  const parsed = TaskPayloadSchema.safeParse(payload ?? {});
+  if (!parsed.success) throw new PermanentError(`invalid task payload: ${z.prettifyError(parsed.error)}`);
+  const p = parsed.data;
   if (typeof p.delayMs === "number") await new Promise((r) => setTimeout(r, p.delayMs as number));
-  if (p.action === "fs") return platformFs(p.request!);
+  if (p.action === "fs") return platformFs(p.request);
   if (p.action === "transform") {
-    const input = (await platformFs({ op: "read", path: p.from! })) as string;
-    return platformFs({ op: "write", path: p.to!, content: input.toUpperCase() + (p.suffix ?? "") });
+    const input = (await platformFs({ op: "read", path: p.from })) as string;
+    return platformFs({ op: "write", path: p.to, content: input.toUpperCase() + (p.suffix ?? "") });
   }
   if (p.fail) throw new Error("task asked to fail");
   return { output: String(p.text ?? "").toUpperCase(), handledBy: identity!.agentId, pid: process.pid };
@@ -79,7 +88,8 @@ function handle(msg: AgentMessage): void {
     const pending = fsPending.get(msg.requestId);
     fsPending.delete(msg.requestId);
     if (msg.ok) pending?.resolve(msg.result);
-    else pending?.reject(new Error(msg.error));
+    // A permission denial won't change on retry (grants are managed out of band).
+    else pending?.reject(msg.code === "EACCES" ? new PermanentError(msg.error) : new Error(msg.error));
     return;
   }
 
@@ -103,7 +113,13 @@ function handle(msg: AgentMessage): void {
       log(`executing task ${msg.taskId}`);
       executeTask(msg.payload).then(
         (result) => reply({ type: "TASK_COMPLETED", taskId: msg.taskId, result }),
-        (err) => reply({ type: "ERROR", message: String(err), correlationId: msg.taskId }),
+        (err) =>
+          reply({
+            type: "ERROR",
+            message: String(err),
+            correlationId: msg.taskId,
+            retryable: !(err instanceof PermanentError),
+          }),
       );
       return;
     case "SHUTDOWN":

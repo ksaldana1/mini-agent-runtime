@@ -2,9 +2,8 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { z } from "zod";
 import type { Db } from "./database.js";
-import type { Dispatcher } from "./dispatcher.js";
 import type { AgentRegistry } from "./identity.js";
-import type { Inbox } from "./inbox.js";
+import type { Inbox, InboxItem } from "./inbox.js";
 import { renderTemplate } from "../shared/template.js";
 
 // ── Definitions ─────────────────────────────────────────────────────────────
@@ -84,65 +83,23 @@ export interface WorkflowEvent {
  *
  * `reconcile` derives the next transition purely from SQLite state, so it is idempotent
  * and safe to call any time. It runs:
- *   - on dispatcher events ("completed", "failed", "released") — the fast path;
- *   - for every running workflow at startup — the recovery path, covering events lost
+ *   - on the inbox's "settled" event for a step's item — the fast path;
+ *   - for every running workflow in recover() — the startup path, covering events lost
  *     while the platform was down.
  *
  * Events: "transition" (WorkflowEvent).
  */
 export class WorkflowService extends EventEmitter {
-  /** Number of workflows that made progress during the startup recovery pass. */
-  readonly recoveredOnStartup: number;
-
   constructor(
     private readonly db: Db,
     private readonly registry: AgentRegistry,
     private readonly inbox: Inbox,
-    dispatcher: Dispatcher,
   ) {
     super();
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS workflows (
-        id           TEXT PRIMARY KEY,
-        name         TEXT NOT NULL,
-        definition   TEXT NOT NULL,
-        input        TEXT NOT NULL,
-        status       TEXT NOT NULL,
-        current_step INTEGER NOT NULL,
-        output       TEXT,
-        error        TEXT,
-        created_at   TEXT NOT NULL,
-        updated_at   TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS workflow_steps (
-        workflow_id   TEXT NOT NULL REFERENCES workflows(id),
-        idx           INTEGER NOT NULL,
-        name          TEXT NOT NULL,
-        status        TEXT NOT NULL,
-        assignment    INTEGER NOT NULL DEFAULT 0,
-        agent_id      TEXT REFERENCES agents(id),
-        inbox_item_id TEXT REFERENCES inbox(id),
-        result        TEXT,
-        error         TEXT,
-        started_at    TEXT,
-        finished_at   TEXT,
-        PRIMARY KEY (workflow_id, idx)
-      );
-      CREATE INDEX IF NOT EXISTS workflow_steps_item ON workflow_steps (inbox_item_id);
-      CREATE TABLE IF NOT EXISTS workflow_events (
-        workflow_id TEXT NOT NULL REFERENCES workflows(id),
-        at          TEXT NOT NULL,
-        event       TEXT NOT NULL,
-        detail      TEXT NOT NULL
-      );
-    `);
 
-    dispatcher.on("completed", ({ item }) => this.reconcileForItem(item.id));
-    dispatcher.on("failed", ({ item }) => this.reconcileForItem(item.id));
-    // A crash can push an item to "failed" via releaseClaims without a per-item event.
-    dispatcher.on("released", () => this.reconcileAll());
-
-    this.recoveredOnStartup = this.reconcileAll();
+    // Every path to a final status (complete, fail, crash release, startup release)
+    // emits "settled" for that item, so this is the only trigger needed.
+    inbox.on("settled", (item: InboxItem) => this.reconcileForItem(item.id));
   }
 
   // ── Public API ────────────────────────────────────────────────────────────
@@ -192,6 +149,14 @@ export class WorkflowService extends EventEmitter {
     return this.db
       .prepare(`SELECT at, workflow_id AS workflowId, event, detail FROM workflow_events WHERE workflow_id = ? ORDER BY rowid`)
       .all(workflowId) as WorkflowEvent[];
+  }
+
+  /**
+   * Platform startup: catch up on steps that settled while no workflow service was
+   * listening. Returns how many workflows moved.
+   */
+  recover(): number {
+    return this.reconcileAll();
   }
 
   /** Advance every running workflow as far as durable state allows. Returns how many moved. */

@@ -8,6 +8,7 @@ import type { FsRequest } from "../shared/protocol.js";
 export type Access = "read" | "write";
 
 export class FsDeniedError extends Error {
+  readonly code = "EACCES";
   /** True once the denial has been written to fs_audit (avoids double-logging). */
   constructor(message: string, readonly audited = false) {
     super(`EACCES: ${message}`);
@@ -65,24 +66,6 @@ export class AgentFilesystem {
       mkdirSync(join(root, dir), { recursive: true });
     }
     this.realRoot = realpathSync(root);
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS fs_grants (
-        agent_id   TEXT NOT NULL REFERENCES agents(id),
-        path       TEXT NOT NULL,
-        access     TEXT NOT NULL,
-        granted_by TEXT REFERENCES agents(id),
-        created_at TEXT NOT NULL,
-        PRIMARY KEY (agent_id, path)
-      );
-      CREATE TABLE IF NOT EXISTS fs_audit (
-        at       TEXT NOT NULL,
-        agent_id TEXT NOT NULL,
-        op       TEXT NOT NULL,
-        path     TEXT NOT NULL,
-        allowed  INTEGER NOT NULL,
-        reason   TEXT NOT NULL
-      );
-    `);
   }
 
   // ── Agent-facing entry point (called with the identity of the IPC channel) ──

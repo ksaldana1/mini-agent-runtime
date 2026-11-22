@@ -26,7 +26,7 @@ describe("renderTemplate", () => {
 
 /**
  * No runtimes here: the tests play the agent's part by claiming/completing inbox
- * items directly, then call reconcile() — exactly what the dispatcher events trigger.
+ * items directly, then call reconcile() — exactly what the inbox "settled" event triggers.
  */
 describe("WorkflowService (state machine over the inbox)", () => {
   let db: Db;
@@ -67,7 +67,7 @@ describe("WorkflowService (state machine over the inbox)", () => {
     inbox = new Inbox(db, registry);
     supervisor = new Supervisor(db, registry);
     dispatcher = new Dispatcher(supervisor, inbox);
-    workflows = new WorkflowService(db, registry, inbox, dispatcher);
+    workflows = new WorkflowService(db, registry, inbox);
     a = registry.create("a");
     b = registry.create("b");
     c = registry.create("c");
@@ -144,6 +144,22 @@ describe("WorkflowService (state machine over the inbox)", () => {
     expect(workflows.get(wf.id)!.status).toBe("completed");
   });
 
+  it("advances on its own when the inbox settles a step's item, including via crash release", async () => {
+    const tick = () => new Promise<void>((r) => setImmediate(r));
+    const wf = workflows.start(def(), {});
+    finish(a, { out: "x" }); // no reconcile() call: the "settled" event drives it
+    await tick();
+    expect(workflows.steps(wf.id)[1]).toMatchObject({ status: "assigned", agentId: b.id });
+
+    // b's runtime crashes on every attempt; the last release marks the item failed.
+    for (let inc = 1; inc <= 3; inc++) {
+      inbox.claimNext(b.id, inc);
+      inbox.releaseClaims(b.id, inc);
+    }
+    await tick();
+    expect(workflows.steps(wf.id)[1]).toMatchObject({ status: "assigned", agentId: c.id, assignment: 2 });
+  });
+
   it("fails the workflow when no candidates are left", () => {
     const wf = workflows.start(def(), {});
     failHard(a);
@@ -168,9 +184,11 @@ describe("WorkflowService (state machine over the inbox)", () => {
     finish(a, { out: "x" });
     expect(workflows.get(wf.id)!.currentStep).toBe(0);
 
-    const restarted = new WorkflowService(db, registry, inbox, new Dispatcher(new Supervisor(db, registry), inbox));
-    expect(restarted.recoveredOnStartup).toBe(1);
+    const restarted = new WorkflowService(db, registry, inbox);
+    expect(restarted.get(wf.id)!.currentStep).toBe(0); // constructing doesn't recover
+    expect(restarted.recover()).toBe(1);
     expect(restarted.get(wf.id)!.currentStep).toBe(1);
+    expect(restarted.recover()).toBe(0);
   });
 });
 
@@ -194,7 +212,8 @@ describe("Workflows end to end (real runtimes)", () => {
     const fs = new AgentFilesystem(db, registry, root);
     const inbox = new Inbox(db, registry);
     supervisor = new Supervisor(db, registry, { fsHandler: (id, req) => fs.handle(id, req) });
-    const workflows = new WorkflowService(db, registry, inbox, new Dispatcher(supervisor, inbox));
+    new Dispatcher(supervisor, inbox);
+    const workflows = new WorkflowService(db, registry, inbox);
     const worker = registry.create("worker");
 
     mkdirSync(join(root, "shared/documents"), { recursive: true });

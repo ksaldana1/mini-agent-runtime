@@ -72,10 +72,14 @@ export interface SendOptions {
  * only apply if that incarnation still holds the claim, so a late answer from a
  * dead process can't clobber a redelivery (a simple fencing token).
  *
- * Emits "enqueued" (InboxItem) after a new item is stored (asynchronously, next microtask).
+ * Events (both emitted on a later microtask, so listeners only ever see committed rows):
+ *   "enqueued" (InboxItem) — a new item was stored.
+ *   "settled"  (InboxItem) — an item reached a final status (completed or failed), via
+ *              complete, fail, releaseClaims, or releaseAllClaims.
  */
 export class Inbox extends EventEmitter {
   private readonly maxAttempts: number;
+  private readonly waiters = new Map<string, Set<(item: InboxItem) => void>>();
 
   constructor(
     private readonly db: Db,
@@ -156,28 +160,35 @@ export class Inbox extends EventEmitter {
 
   /** Acknowledge successful processing. Returns false if this incarnation no longer holds the claim. */
   complete(id: string, incarnation: number, result: unknown): boolean {
-    return (
-      this.db
-        .prepare(
-          `UPDATE inbox SET status = 'completed', acknowledged_at = ?, result = ?
-            WHERE id = ? AND status = 'claimed' AND claimed_by_incarnation = ?`,
-        )
-        .run(new Date().toISOString(), JSON.stringify(result ?? null), id, incarnation).changes > 0
-    );
+    const row = this.db
+      .prepare(
+        `UPDATE inbox SET status = 'completed', acknowledged_at = ?, result = ?
+          WHERE id = ? AND status = 'claimed' AND claimed_by_incarnation = ?
+          RETURNING *`,
+      )
+      .get(new Date().toISOString(), JSON.stringify(result ?? null), id, incarnation) as Row | undefined;
+    this.settle(row ? [row] : []);
+    return row !== undefined;
   }
 
-  /** The agent reported an error: retry if attempts remain, else mark failed. */
-  fail(id: string, incarnation: number, error: string): boolean {
-    return (
-      this.db
-        .prepare(
-          `UPDATE inbox
-              SET status = CASE WHEN attempts >= ? THEN 'failed' ELSE 'pending' END,
-                  last_error = ?, claimed_at = NULL, claimed_by_incarnation = NULL
-            WHERE id = ? AND status = 'claimed' AND claimed_by_incarnation = ?`,
-        )
-        .run(this.maxAttempts, error, id, incarnation).changes > 0
-    );
+  /**
+   * The agent reported an error. A retryable error goes back to pending while attempts
+   * remain; a non-retryable one (or the last attempt) marks the item failed.
+   * Returns false if this incarnation no longer holds the claim.
+   */
+  fail(id: string, incarnation: number, error: string, opts: { retryable?: boolean } = {}): boolean {
+    const retryable = opts.retryable ?? true;
+    const row = this.db
+      .prepare(
+        `UPDATE inbox
+            SET status = CASE WHEN ? = 0 OR attempts >= ? THEN 'failed' ELSE 'pending' END,
+                last_error = ?, claimed_at = NULL, claimed_by_incarnation = NULL
+          WHERE id = ? AND status = 'claimed' AND claimed_by_incarnation = ?
+          RETURNING *`,
+      )
+      .get(retryable ? 1 : 0, this.maxAttempts, error, id, incarnation) as Row | undefined;
+    this.settle(row ? [row] : []);
+    return row !== undefined;
   }
 
   /**
@@ -186,27 +197,66 @@ export class Inbox extends EventEmitter {
    * that reliably crashes its agent would be redelivered forever.
    */
   releaseClaims(recipientAgentId: string, incarnation: number): number {
-    return this.db
+    const rows = this.db
       .prepare(
         `UPDATE inbox
             SET status = CASE WHEN attempts >= ? THEN 'failed' ELSE 'pending' END,
                 last_error = 'runtime exited while processing',
                 claimed_at = NULL, claimed_by_incarnation = NULL
-          WHERE recipient_agent_id = ? AND status = 'claimed' AND claimed_by_incarnation = ?`,
+          WHERE recipient_agent_id = ? AND status = 'claimed' AND claimed_by_incarnation = ?
+          RETURNING *`,
       )
-      .run(this.maxAttempts, recipientAgentId, incarnation).changes;
+      .all(this.maxAttempts, recipientAgentId, incarnation) as Row[];
+    this.settle(rows);
+    return rows.length;
   }
 
   /** Platform startup: no runtime from a previous platform process is alive, so every claim is stale. */
   releaseAllClaims(): number {
-    return this.db
+    const rows = this.db
       .prepare(
         `UPDATE inbox
             SET status = CASE WHEN attempts >= ? THEN 'failed' ELSE 'pending' END,
                 last_error = 'platform restarted while processing',
                 claimed_at = NULL, claimed_by_incarnation = NULL
-          WHERE status = 'claimed'`,
+          WHERE status = 'claimed'
+          RETURNING *`,
       )
-      .run(this.maxAttempts).changes;
+      .all(this.maxAttempts) as Row[];
+    this.settle(rows);
+    return rows.length;
+  }
+
+  /**
+   * Resolves once the item is completed or failed. Resolves immediately if it already
+   * is. Rejects if no such item exists.
+   */
+  waitFor(id: string): Promise<InboxItem> {
+    const item = this.get(id);
+    if (!item) return Promise.reject(new Error(`unknown inbox item ${id}`));
+    if (isSettled(item)) return Promise.resolve(item);
+    // No await between the read above and registering here, and "settled" is emitted on a
+    // later microtask, so a settlement can't slip in between.
+    return new Promise((resolve) => {
+      let set = this.waiters.get(id);
+      if (!set) this.waiters.set(id, (set = new Set()));
+      set.add(resolve);
+    });
+  }
+
+  /** Emit "settled" for rows that reached a final status, once the caller's transaction has committed. */
+  private settle(rows: Row[]): void {
+    const settled = rows.map(fromRow).filter(isSettled);
+    if (settled.length === 0) return;
+    queueMicrotask(() => {
+      for (const item of settled) {
+        this.emit("settled", item);
+        const waiters = this.waiters.get(item.id);
+        this.waiters.delete(item.id);
+        for (const resolve of waiters ?? []) resolve(item);
+      }
+    });
   }
 }
+
+const isSettled = (item: InboxItem): boolean => item.status === "completed" || item.status === "failed";
