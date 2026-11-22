@@ -4,7 +4,7 @@ import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 import type { Db } from "./database.js";
 import type { AgentRegistry } from "./identity.js";
-import { AgentResponseSchema, type AgentMessage, type AgentResponse } from "../shared/protocol.js";
+import { AgentResponseSchema, type AgentMessage, type AgentResponse, type FsRequest } from "../shared/protocol.js";
 
 /** State of one runtime incarnation (a process), not of the logical agent. */
 export type RuntimeState = "starting" | "running" | "stopping" | "exited" | "crashed";
@@ -45,6 +45,11 @@ export interface SupervisorOptions {
   stopTimeoutMs?: number;
   /** Forward runtime stdout/stderr to ours (handy in the demo, noisy in tests). */
   inheritStdio?: boolean;
+  /**
+   * Serves runtime-initiated filesystem requests. `agentId` comes from the IPC
+   * channel the request arrived on, never from the request itself.
+   */
+  fsHandler?: (agentId: string, request: FsRequest) => unknown;
 }
 
 const DEFAULT_ENTRY = fileURLToPath(new URL("../runtime/agent.ts", import.meta.url));
@@ -62,6 +67,7 @@ export class Supervisor extends EventEmitter {
   private readonly requestTimeoutMs: number;
   private readonly stopTimeoutMs: number;
   private readonly inheritStdio: boolean;
+  private readonly fsHandler: SupervisorOptions["fsHandler"];
 
   constructor(
     private readonly db: Db,
@@ -73,6 +79,7 @@ export class Supervisor extends EventEmitter {
     this.requestTimeoutMs = opts.requestTimeoutMs ?? 5_000;
     this.stopTimeoutMs = opts.stopTimeoutMs ?? 2_000;
     this.inheritStdio = opts.inheritStdio ?? false;
+    this.fsHandler = opts.fsHandler;
 
     // Platform startup: runtimes from a previous platform process exited when their IPC
     // channel closed, but we never saw it. Close out their records.
@@ -227,6 +234,10 @@ export class Supervisor extends EventEmitter {
       return;
     }
     const msg = parsed.data;
+    if (msg.type === "FS_REQUEST") {
+      this.serveFs(runtime, msg.requestId, msg.request);
+      return;
+    }
     const id =
       msg.type === "READY" ? "__init__"
       : msg.type === "TASK_COMPLETED" ? msg.taskId
@@ -240,6 +251,18 @@ export class Supervisor extends EventEmitter {
     clearTimeout(pending.timer);
     runtime.pending.delete(id!);
     pending.resolve(msg);
+  }
+
+  private serveFs(runtime: Runtime, requestId: string, request: FsRequest): void {
+    let reply: AgentMessage;
+    try {
+      if (!this.fsHandler) throw new Error("filesystem service not available");
+      if (runtime.state !== "running") throw new Error("runtime is not running");
+      reply = { type: "FS_RESPONSE", requestId, ok: true, result: this.fsHandler(runtime.agentId, request) };
+    } catch (err) {
+      reply = { type: "FS_RESPONSE", requestId, ok: false, error: (err as Error).message };
+    }
+    if (runtime.child.connected) this.send(runtime, reply);
   }
 
   private running(agentId: string): Runtime {
