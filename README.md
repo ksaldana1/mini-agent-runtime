@@ -20,6 +20,51 @@ npm run typecheck
 Requires Node ≥ 24 (developed on 26). Run `npm run demo:lifecycle` twice: the second run
 reloads Agent A from `data/platform.db` and continues its incarnation count.
 
+## Library API (in progress)
+
+The platform is turning into a small library ([LIBRARY_PLAN.md](LIBRARY_PLAN.md)). Phases 0–2 are
+done: agents, typed sends, and events. Workflows and listeners defined in code come in Phase 3. The
+public entry point is the package itself (`"exports": "./src/lib/index.ts"`, run through `tsx`):
+
+```ts
+import { createPlatform } from "mini-agent-runtime";
+import notes from "./agents/notes.ts"; // export default defineAgent(import.meta.url, { tasks: { save: ... } })
+
+await using platform = createPlatform({ dataDir: "data" });
+const agent = platform.agent("notes", notes, { restart: "on-crash" }); // by name: same agent every boot
+agent.grant("shared/documents", "read");
+
+await platform.start();                         // recovery, listeners, autostart agents
+const task = agent.send("save", { name: "a", text: "hello" }); // typed, validated before enqueueing
+const out = await task.result();                // resolves on settlement; no polling
+```
+
+- **Lifecycle.** `createPlatform` only wires the services. `start()` runs recovery (stale runtime rows,
+  stale claims, workflow catch-up), starts listener scanning, then starts every `autostart` agent
+  (the default). `close()` stops everything and closes the database; `await using` calls it.
+- **Agents** are registered by name on every boot (D3). The name is the identity, so the same name
+  gets the same id, inbox, and files. Registering a name twice in one process is an error. The
+  default restart policy is `on-crash`.
+- **`send(task, input)`** validates `input` with the task's schema in the caller's process
+  (`TaskInputError`, nothing enqueued), then enqueues `{ task, input }` durably. `result()` resolves
+  once the task completes, across crashes and redeliveries, or rejects with `TaskFailedError`.
+  `platform.task(id)` reattaches to a task from an earlier process.
+- **Events.** `platform.events` re-emits kernel events with agent names. A complete timeline logger:
+
+```ts
+const t0 = Date.now();
+platform.events.onAny((name, e) => {
+  const who = "agent" in e ? e.agent : "workflow" in e ? e.workflow : "";
+  const what =
+    "error" in e && e.error ? e.error
+    : "task" in e && e.task ? e.task
+    : "path" in e ? e.path
+    : "detail" in e ? e.detail
+    : "";
+  console.log(`+${((Date.now() - t0) / 1000).toFixed(2)}s ${name.padEnd(20)} ${who.padEnd(16)} ${what}`);
+});
+```
+
 ## How it fits together
 
 ```text
@@ -54,7 +99,10 @@ reloads Agent A from `data/platform.db` and continues its incarnation count.
 | `src/shared/template.ts` | `{{dotted.path}}` filling for listener and workflow payloads. |
 | `src/runtime/host.ts` | The child process: a generic host. Starts anonymous; `INIT` tells it who it is and which agent module to import. Validates each `TASK`'s input with the named task's schema, runs the handler with a context (`ctx.fs` sends `FS_REQUEST` to the platform), and handles `PING` / `SHUTDOWN`. |
 | `src/lib/agent.ts` | `defineAgent(import.meta.url, { tasks })`: an agent's code. Typed tasks (Zod input schema + `run(input, ctx)`), `AgentContext`, and the `TaskNames` / `TaskInput` / `TaskOutput` helper types. |
-| `src/lib/errors.ts` | `PermanentError` and `FsDeniedError`: errors that fail a task without retries. |
+| `src/lib/errors.ts` | `PermanentError` and `FsDeniedError` (fail a task without retries); `TaskFailedError` and `TaskInputError` (thrown to callers). |
+| `src/lib/platform.ts` | `createPlatform`: wires the kernel, runs recovery in `start()`, and hands out typed `AgentHandle`s and `TaskHandle`s. |
+| `src/lib/events.ts` | `platform.events`: one typed emitter for everything observable, with agent names. |
+| `src/lib/index.ts` | The public entry point. Exports the library, never kernel classes. |
 | `src/agents/toy.ts` | The toy agent the milestone demos use: `uppercase`, `transform`, and `fs` tasks. |
 
 ### Agent code: `defineAgent` and the runtime host

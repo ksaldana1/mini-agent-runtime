@@ -565,6 +565,11 @@ All five milestones are implemented (see README). This section records what the 
 - Agent modules are imported by both the platform and every runtime, so they must be side-effect free at the top level. Nothing enforces this.
 - A listener's default payload (`{ event, path, listenerId }`) isn't a task, so it fails permanently if delivered. Listeners need a `{ task, input }` template until Phase 3 of the library plan adds code-defined targets.
 
+**Library API**
+- An agent's name is its identity. Renaming an agent in code creates a new agent with an empty inbox and directory; the old one lingers in the database.
+- `TaskHandle.result()` promises still waiting when the platform closes never settle. Reattach after the next boot with `platform.task(id)`.
+- Task results cross IPC as JSON, so values like `Date` or `Map` don't keep their types, even though `TaskOutput` says they do.
+
 **Lifecycle**
 - Restart policies live in memory and must be set again on every boot. Crash counts for the restart window are not persisted either.
 - Stopping an agent doesn't wait for its in-flight task. The task is redelivered, and that delivery counts as an attempt.
@@ -594,7 +599,7 @@ All five milestones are implemented (see README). This section records what the 
 
 ### Next Steps
 
-1. **Library API.** In progress; see [LIBRARY_PLAN.md](LIBRARY_PLAN.md). Phase 0 (migrations, settlement events, permanent errors, explicit recovery, restart policies) and Phase 1 (`defineAgent`, the generic runtime host, `AgentContext`) are done.
+1. **Library API.** In progress; see [LIBRARY_PLAN.md](LIBRARY_PLAN.md). Phase 0 (migrations, settlement events, permanent errors, explicit recovery, restart policies) Phase 1 (`defineAgent`, the generic runtime host, `AgentContext`), and Phase 2 (`createPlatform`, typed handles and `send`, events) are done.
 2. **Step deadlines.** Give each workflow step a timeout that triggers reassignment to the next candidate agent, so a step held by an agent that never runs doesn't block the workflow.
 3. **Agent-initiated messaging and listeners.** Add IPC messages that let runtimes send inbox messages and register listeners, with a check on who may send to whom.
 4. **OS-enforced isolation.** Give each agent its own Unix user (or namespace/container), and turn platform grants into real file ownership, POSIX permissions, or ACLs, so the kernel enforces access instead of TypeScript.

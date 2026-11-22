@@ -1,5 +1,6 @@
 import { mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { dirname, join, posix } from "node:path";
 import type { Db } from "./database.js";
 import type { AgentRegistry } from "./identity.js";
@@ -53,8 +54,10 @@ export interface AuditEntry {
  *
  * This is platform-level authorization, NOT OS-enforced security: runtimes run as
  * the same Unix user and could bypass this by calling node:fs directly. See README.
+ *
+ * Events: "denied" (AuditEntry), for every audited denial.
  */
-export class AgentFilesystem {
+export class AgentFilesystem extends EventEmitter {
   private readonly realRoot: string;
 
   constructor(
@@ -62,6 +65,7 @@ export class AgentFilesystem {
     private readonly registry: AgentRegistry,
     readonly root: string,
   ) {
+    super();
     for (const dir of ["agents", "shared/documents", "shared/artifacts"]) {
       mkdirSync(join(root, dir), { recursive: true });
     }
@@ -241,9 +245,11 @@ export class AgentFilesystem {
   }
 
   private audit(agentId: string, op: string, path: string, allowed: boolean, reason: string): void {
+    const entry: AuditEntry = { at: new Date().toISOString(), agentId, op, path, allowed, reason };
     this.db
       .prepare(`INSERT INTO fs_audit (at, agent_id, op, path, allowed, reason) VALUES (?, ?, ?, ?, ?, ?)`)
-      .run(new Date().toISOString(), agentId, op, path, allowed ? 1 : 0, reason);
+      .run(entry.at, agentId, op, path, allowed ? 1 : 0, reason);
+    if (!allowed) this.emit("denied", entry);
   }
 
   // ── Path handling ─────────────────────────────────────────────────────────

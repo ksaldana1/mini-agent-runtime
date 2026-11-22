@@ -66,6 +66,10 @@ export class AgentRegistry {
     return (this.db.prepare(`SELECT * FROM agents ORDER BY created_at`).all() as AgentRow[]).map(fromRow);
   }
 
+  updateConfiguration(id: string, configuration: Record<string, unknown>): void {
+    this.db.prepare(`UPDATE agents SET configuration = ? WHERE id = ?`).run(JSON.stringify(configuration), id);
+  }
+
   /** Logical deletion (soft). Terminating the runtime is the supervisor's job, not ours. */
   markDeleted(id: string): void {
     this.db.prepare(`UPDATE agents SET lifecycle_state = 'deleted' WHERE id = ?`).run(id);

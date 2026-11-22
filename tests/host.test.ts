@@ -79,6 +79,17 @@ describe("runtime host", () => {
     await expect(supervisor.start(agent.id)).rejects.toThrow(/failed to start: .*default export is not an agent definition/);
   });
 
+  it("a runtime that refuses to start is not restarted by the policy", async () => {
+    supervisor.setPolicy(agent.id, { restart: "on-crash", backoffMs: 1 });
+    supervisor.setModule(agent.id, fixture("bad-export.ts"));
+    let restarts = 0;
+    supervisor.on("restart-scheduled", () => restarts++);
+    await expect(supervisor.start(agent.id)).rejects.toThrow(/failed to start/);
+    await new Promise((r) => setTimeout(r, 200));
+    expect(restarts).toBe(0);
+    expect(supervisor.history(agent.id)).toHaveLength(1);
+  });
+
   it("refuses to start a module that throws while loading", async () => {
     supervisor.setModule(agent.id, fixture("throws-on-import.ts"));
     await expect(supervisor.start(agent.id)).rejects.toThrow(/failed to start: module exploded at import time/);

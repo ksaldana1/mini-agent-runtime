@@ -1,7 +1,7 @@
 # Library-ification Plan
 
-> **Status (2026-11-22):** plan and all design decisions (D1–D8) approved. **Phases 0–1 done; Phase 1 awaiting review.**
-> Next: **Phase 2**. Read [Handoff notes](#handoff-notes-for-a-fresh-session) first.
+> **Status (2026-11-22):** plan and all design decisions (D1–D8) approved. **Phases 0–2 done; Phase 2 awaiting review.**
+> Next: **Phase 3**. Read [Handoff notes](#handoff-notes-for-a-fresh-session) first.
 
 Turn the platform from "seven classes you wire by hand" into a small library with a typed,
 awaitable API. The current classes in `src/platform/` stay as the internal **kernel**. The new
@@ -130,7 +130,7 @@ These are internal changes that the later phases depend on. Every existing test 
 
 ## Phase 2: `createPlatform` and handles
 
-### ☐ 2.1 `createPlatform` · M
+### ☑ 2.1 `createPlatform` · M
 - `src/lib/platform.ts`: `createPlatform({ dataDir, dbPath?, inbox: { maxAttempts }, listeners: { intervalMs, settleMs } })` wires the kernel in the right order and passes `fsHandler` to the supervisor.
 - Lifecycle:
   - `createPlatform` only wires the services.
@@ -140,22 +140,22 @@ These are internal changes that the later phases depend on. Every existing test 
 - Calling `agent()`, `workflow()`, or `listen()` after `start()` is allowed. Each new registration is reconciled right away.
 - **Done when:** a test boots, registers, starts, and closes a platform, and a second `createPlatform` on the same `dataDir` recovers the first one's state.
 
-### ☐ 2.2 `AgentHandle` · M
+### ☑ 2.2 `AgentHandle` · M
 - `platform.agent(name, def, { restart?, autostart?, configuration? })` gets or creates the agent by **name** and returns a typed `AgentHandle<D>`: `id`, `name`, `start()`, `stop()`, `restart()`, `status()`, `history()`, `grant(path, access)`, `revoke(path)`, `inbox()`.
 - Registering the same name twice in one process is an error. A DB agent with no registered definition can't be started, and the error says why (D3).
 - **Done when:** a test shows that identity is stable across two platform boots in the same `dataDir`.
 
-### ☐ 2.3 Typed `send` and `TaskHandle` · M
+### ☑ 2.3 Typed `send` and `TaskHandle` · M
 - `agent.send(task, input, { idempotencyKey? })` validates `input` with the task's schema on the **parent** side too, failing fast before anything is enqueued. It returns a `TaskHandle<Out>` with `id`, `status()`, and `result()`.
   - `result()` rejects with `TaskFailedError` (carrying `lastError` and `attempts`) if the task fails.
 - `platform.task(id)` reattaches to a task created by an earlier process.
 - **Done when:** there are tests for result after success, rejection after a non-retryable failure, `result()` across a crash and redelivery, and reattaching after a restart. Type tests cover the task name and the input and output types.
 
-### ☐ 2.4 Unified events · S
+### ☑ 2.4 Unified events · S
 - `platform.events`: one typed emitter (`agent.ready`, `agent.exited`, `agent.gave-up`, `task.enqueued`, `task.delivered`, `task.settled`, `listener.fired`, `workflow.transition`, `fs.denied`) that re-emits the kernel events with agent **names** included.
 - **Done when:** the newsroom's timeline logger is about 10 lines long.
 
-### ☐ 2.5 Public entry point · S
+### ☑ 2.5 Public entry point · S
 - `src/lib/index.ts` exports `createPlatform`, `defineAgent`, error classes, and public types, but no kernel classes. In `package.json`, `"exports": { ".": "./src/lib/index.ts" }`.
 - **Done when:** a test imports only from the public entry point.
 
@@ -245,7 +245,7 @@ Read these before touching code.
 **Read first:** this file, then `ARCHITECTURE.md` (the original brief, plus §10 for known limitations), then `README.md` (how each subsystem works and why). The kernel code is in `src/platform/`. The best end-to-end example is `src/demos/newsroom.ts`.
 
 **Where things stand:**
-- Milestones 1–5 from `ARCHITECTURE.md` are complete, and so is Phases 0–1: 106 tests passing, `tsc` clean, six demos working (`npm run demo:newsroom` plus one per milestone).
+- Milestones 1–5 from `ARCHITECTURE.md` are complete, and so is Phases 0–2: 123 tests passing, `tsc` clean, six demos working (`npm run demo:newsroom` plus one per milestone).
 - Phase 0 notes for later phases:
   - Supervisor events added: `restart-scheduled`, `gave-up`, `restart-failed`. Phase 2.4's `agent.gave-up` maps to `gave-up`.
   - `TaskError` (in `supervisor.ts`) carries `retryable`. The runtime marks `EACCES` (the `code` field on `FS_RESPONSE`) and invalid toy payloads as permanent. Phase 1.2's host should do the same for unknown tasks and Zod input failures.
@@ -256,6 +256,14 @@ Read these before touching code.
   - `TaskInput` is the schema's *input* type (defaults optional), which is what `send()` should accept in 2.3. The parent can validate with the same schema before enqueueing.
   - The toy agent's `fs` task uses `share` / `revoke` with `agentId`, matching `ctx.fs`; the old `grant` / `granteeAgentId` shape is gone.
   - A listener's default payload is not a task (see ARCHITECTURE §10). Phase 3.4 removes the problem.
+- Phase 2 notes for later phases:
+  - `Platform` (src/lib/platform.ts) keeps the wired kernel on an `@internal` `kernel` field. Phase 3's `workflow()` / `listen()` / `startWorkflow()` belong on that class, next to `agent()`.
+  - Lifecycle is `created → started → closed`. Agent `start()` / `restart()` require `started`, because recovery must run first. `send()` works in any state except `closed`.
+  - Defaults chosen here: `autostart: true` and `restart: "on-crash"`.
+  - `send()` stores the caller's raw input, not the schema's parsed output, because the runtime parses it again. Workflow steps in 3.2 should do the same.
+  - Events added beyond the plan's list: `agent.restarting`, `agent.start-failed`, and `task.attempt-failed`.
+  - The 2.4 "≈10-line timeline logger" is in the README (`events.onAny`). The newsroom itself is rewritten in 4.1.
+  - Two kernel changes: a runtime that refuses to start is killed deliberately, so the restart policy doesn't loop on a broken module, and `AgentFilesystem` emits `"denied"`.
 - Work is committed on `main`; commit at the end of each phase so every phase has a clean diff.
 
 **Environment quirks (macOS, not Linux):**

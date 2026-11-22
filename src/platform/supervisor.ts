@@ -253,6 +253,9 @@ export class Supervisor extends EventEmitter {
       module,
     });
     if (ready.type === "ERROR") {
+      // The runtime refused to start (e.g. its module won't load). Restarting can't fix
+      // that, so this kill is deliberate: it must not trigger the restart policy.
+      runtime.state = "stopping";
       child.kill("SIGKILL");
       throw new Error(`agent ${agent.name} failed to start: ${ready.message}`);
     }

@@ -20,6 +20,9 @@
   "author": "",
   "license": "ISC",
   "type": "module",
+  "exports": {
+    ".": "./src/lib/index.ts"
+  },
   "bugs": {
     "url": "https://github.com/ksaldana1/mini-agent-runtime/issues"
   },
