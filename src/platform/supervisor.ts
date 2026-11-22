@@ -53,7 +53,8 @@ const DEFAULT_ENTRY = fileURLToPath(new URL("../runtime/agent.ts", import.meta.u
  * The authority on runtime lifecycle. Maps persistent agent IDs to the
  * (temporary) process currently embodying them. At most one live runtime per agent.
  *
- * Events: "runtime-exit" (RuntimeInfo), "protocol-error" ({ agentId, error }).
+ * Events: "runtime-ready" (RuntimeInfo), "runtime-exit" (RuntimeInfo),
+ *         "protocol-error" ({ agentId, error }).
  */
 export class Supervisor extends EventEmitter {
   private readonly runtimes = new Map<string, Runtime>();
@@ -72,6 +73,12 @@ export class Supervisor extends EventEmitter {
     this.requestTimeoutMs = opts.requestTimeoutMs ?? 5_000;
     this.stopTimeoutMs = opts.stopTimeoutMs ?? 2_000;
     this.inheritStdio = opts.inheritStdio ?? false;
+
+    // Platform startup: runtimes from a previous platform process exited when their IPC
+    // channel closed, but we never saw it. Close out their records.
+    this.db
+      .prepare(`UPDATE runtimes SET exited_at = ?, exit_signal = 'PLATFORM_RESTART' WHERE exited_at IS NULL`)
+      .run(new Date().toISOString());
   }
 
   // ── Lifecycle ────────────────────────────────────────────────────────────
@@ -136,7 +143,9 @@ export class Supervisor extends EventEmitter {
       throw new Error(`runtime handshake failed: ${JSON.stringify(ready)}`);
     }
     runtime.state = "running";
-    return this.info(runtime);
+    const info = this.info(runtime);
+    this.emit("runtime-ready", info);
+    return info;
   }
 
   /** Graceful stop: SHUTDOWN over IPC, then SIGKILL if it doesn't exit in time. */

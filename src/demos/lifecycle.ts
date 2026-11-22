@@ -1,14 +1,14 @@
 /**
  * Milestone 1 demo: one persistent agent identity, several runtime incarnations.
  *
- *   npm run demo
+ *   npm run demo:lifecycle
  *
  * Run it twice: the second run finds Agent A already in the database and
  * continues its incarnation count — identity survives platform restarts too.
  */
-import { openDatabase } from "./platform/database.js";
-import { AgentRegistry } from "./platform/identity.js";
-import { Supervisor } from "./platform/supervisor.js";
+import { openDatabase } from "../platform/database.js";
+import { AgentRegistry } from "../platform/identity.js";
+import { Supervisor } from "../platform/supervisor.js";
 
 const db = openDatabase("data/platform.db");
 const registry = new AgentRegistry(db);

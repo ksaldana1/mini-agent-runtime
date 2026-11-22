@@ -29,10 +29,19 @@ function log(text: string): void {
   console.log(`  [runtime ${who} pid=${process.pid}] ${text}`);
 }
 
-/** The "intelligence" of this toy agent. Swap this out later; the platform doesn't care. */
-function executeTask(payload: unknown): unknown {
-  const text = typeof payload === "object" && payload !== null && "text" in payload ? String(payload.text) : "";
-  return { output: text.toUpperCase(), handledBy: identity!.agentId, pid: process.pid };
+/**
+ * The "intelligence" of this toy agent. Swap this out later; the platform doesn't care.
+ * Payload knobs for demos/tests: `delayMs` (simulate slow work), `fail` (throw).
+ */
+async function executeTask(payload: unknown): Promise<unknown> {
+  const p = (typeof payload === "object" && payload !== null ? payload : {}) as {
+    text?: unknown;
+    delayMs?: unknown;
+    fail?: unknown;
+  };
+  if (typeof p.delayMs === "number") await new Promise((r) => setTimeout(r, p.delayMs as number));
+  if (p.fail) throw new Error("task asked to fail");
+  return { output: String(p.text ?? "").toUpperCase(), handledBy: identity!.agentId, pid: process.pid };
 }
 
 function handle(msg: AgentMessage): void {
@@ -54,11 +63,10 @@ function handle(msg: AgentMessage): void {
       return;
     case "TASK":
       log(`executing task ${msg.taskId}`);
-      try {
-        reply({ type: "TASK_COMPLETED", taskId: msg.taskId, result: executeTask(msg.payload) });
-      } catch (err) {
-        reply({ type: "ERROR", message: String(err), correlationId: msg.taskId });
-      }
+      executeTask(msg.payload).then(
+        (result) => reply({ type: "TASK_COMPLETED", taskId: msg.taskId, result }),
+        (err) => reply({ type: "ERROR", message: String(err), correlationId: msg.taskId }),
+      );
       return;
     case "SHUTDOWN":
       log("shutting down");
