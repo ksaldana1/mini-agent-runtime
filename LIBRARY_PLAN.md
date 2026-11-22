@@ -1,7 +1,7 @@
 # Library-ification Plan
 
-> **Status (2026-11-22):** plan and all design decisions (D1–D8) approved. **Phases 0–2 done; Phase 2 awaiting review.**
-> Next: **Phase 3**. Read [Handoff notes](#handoff-notes-for-a-fresh-session) first.
+> **Status (2026-11-22):** plan and all design decisions (D1–D8) approved. **Phases 0–3 done; Phase 3 awaiting review.**
+> Next: **Phase 4**. Read [Handoff notes](#handoff-notes-for-a-fresh-session) first.
 
 Turn the platform from "seven classes you wire by hand" into a small library with a typed,
 awaitable API. The current classes in `src/platform/` stay as the internal **kernel**. The new
@@ -163,14 +163,14 @@ These are internal changes that the later phases depend on. Every existing test 
 
 ## Phase 3: Workflows and listeners defined in code
 
-### ☐ 3.1 Workflow builder · M
+### ☑ 3.1 Workflow builder · M
 - `platform.workflow(name).input(schema).step(stepName, agentOrCandidates, task, (ctx) => input).build()` returns a `WorkflowRef<In, Out>`.
   - Each `.step` adds the task's output type to `ctx.steps.<stepName>`, so later steps see typed results.
   - The last step's output becomes the workflow's output.
 - Definitions live in an in-memory registry keyed by name (D1, D3).
 - **Done when:** type tests show step results flow into later steps.
 
-### ☐ 3.2 `WorkflowService` uses registered definitions · M
+### ☑ 3.2 `WorkflowService` uses registered definitions · M
 - The DB keeps `name`, a **fingerprint** (a hash of the step names, tasks, and candidate agent names), `input`, and step progress. It no longer stores the definition JSON.
 - `assign` calls the step's input function and stores the computed payload in the inbox, as it does now.
 - Recovery and reconcile:
@@ -178,11 +178,11 @@ These are internal changes that the later phases depend on. Every existing test 
   - If the fingerprint doesn't match, the workflow is marked `failed` with `definition changed`. That's simple and explicit; resuming across definition changes can come later.
 - **Done when:** the existing workflow tests are ported, plus tests for an unregistered definition and a fingerprint mismatch.
 
-### ☐ 3.3 `startWorkflow` and `WorkflowHandle` · S
+### ☑ 3.3 `startWorkflow` and `WorkflowHandle` · S
 - `platform.startWorkflow(ref, input, { idempotencyKey? })` returns a `WorkflowHandle<Out>` with `id`, `status()`, `steps()`, `events()`, and `result()`. Add a unique `workflows.idempotency_key` column (migration).
 - **Done when:** there are tests for result, duplicate starts with the same key, and reattaching after a restart.
 
-### ☐ 3.4 Named listeners with code targets · M
+### ☑ 3.4 Named listeners with code targets · M
 - `platform.listen(name, { dir, events })` returns a builder with two targets:
   - `.send(agent, task, (event) => input)`: the target agent must have read access to `dir` (the current rule).
   - `.startWorkflow(ref, (event) => input)`: a **platform-owned** listener with no permission check, which needs a migration to make `target_agent_id` nullable. The workflow's idempotency key is `listener:<name>:<event>:<path>:<mtime>`.
@@ -245,7 +245,7 @@ Read these before touching code.
 **Read first:** this file, then `ARCHITECTURE.md` (the original brief, plus §10 for known limitations), then `README.md` (how each subsystem works and why). The kernel code is in `src/platform/`. The best end-to-end example is `src/demos/newsroom.ts`.
 
 **Where things stand:**
-- Milestones 1–5 from `ARCHITECTURE.md` are complete, and so is Phases 0–2: 123 tests passing, `tsc` clean, six demos working (`npm run demo:newsroom` plus one per milestone).
+- Milestones 1–5 from `ARCHITECTURE.md` are complete, and so is Phases 0–3: 147 tests passing, `tsc` clean, six demos working (`npm run demo:newsroom` plus one per milestone).
 - Phase 0 notes for later phases:
   - Supervisor events added: `restart-scheduled`, `gave-up`, `restart-failed`. Phase 2.4's `agent.gave-up` maps to `gave-up`.
   - `TaskError` (in `supervisor.ts`) carries `retryable`. The runtime marks `EACCES` (the `code` field on `FS_RESPONSE`) and invalid toy payloads as permanent. Phase 1.2's host should do the same for unknown tasks and Zod input failures.
@@ -264,6 +264,13 @@ Read these before touching code.
   - Events added beyond the plan's list: `agent.restarting`, `agent.start-failed`, and `task.attempt-failed`.
   - The 2.4 "≈10-line timeline logger" is in the README (`events.onAny`). The newsroom itself is rewritten in 4.1.
   - Two kernel changes: a runtime that refuses to start is killed deliberately, so the restart policy doesn't loop on a broken module, and `AgentFilesystem` emits `"denied"`.
+- Phase 3 notes for Phase 4:
+  - Templates are gone (`src/shared/template.ts` deleted). Kernel workflows and listeners take functions: `workflows.register({ name, steps: [{ name, agents, task, input(ctx) }] })` + `start(name, input)`, and `listeners.register(name, { path, target })` with an `agent` or `platform` target. The M4/M5 demos and the current newsroom use these kernel APIs.
+  - Migration 2 rebuilds `listeners` (named; nullable target). `migrate()` now turns foreign keys off around migrations, as SQLite recommends, so table rebuilds don't cascade-delete.
+  - A listener → workflow start happens *inside* the scan transaction (a `platform` target). That's what makes the chain crash-safe, with the idempotency key as the second layer.
+  - Public names: `platform.workflowRun(id)` reattaches to a run (`platform.workflow(name)` was taken by the builder). Events added: `workflow.settled`, `workflow.skipped`, `listener.error`, `listener.skipped`. `listener.fired` now has `listener`, plus nullable `agent` / `taskId` / `workflowId`.
+  - The workflow builder needs `.input(schema)` first (it's the only method on `platform.workflow(name)`), which keeps `startWorkflow`'s input type simple.
+  - For 4.1: name workflows and listeners stably (not per run) in the new example, and use `dataDir` under `examples/newsroom/data` so old demo rows in `data/` don't show up as orphans.
 - Work is committed on `main`; commit at the end of each phase so every phase has a clean diff.
 
 **Environment quirks (macOS, not Linux):**

@@ -155,6 +155,15 @@ export class AgentFilesystem extends EventEmitter {
     return rows.map((r) => ({ ...r, allowed: r.allowed === 1 }));
   }
 
+  /**
+   * Normalize a logical path given by the platform itself (no agent, so no "~").
+   * Throws FsDeniedError for paths that escape the root.
+   */
+  normalizePlatformPath(raw: string): string {
+    if (raw === "~" || raw.startsWith("~/")) throw new FsDeniedError(`"~" needs an agent: ${raw}`);
+    return this.normalize("", raw);
+  }
+
   /** Logical home directory of an agent. */
   home(agentId: string): string {
     return `agents/${agentId}`;

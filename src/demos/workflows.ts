@@ -19,8 +19,11 @@ import toy from "../agents/toy.js";
 const DB_PATH = "data/platform.db";
 const DATA = "data";
 
-/** Everything a platform process holds. Booting twice = a platform restart. */
-function boot() {
+/**
+ * Everything a platform process holds. Booting twice = a platform restart.
+ * Code supplies the workflow definition on every boot (`defineReview`), before recovery.
+ */
+function boot(defineReview?: (w: WorkflowService) => void) {
   const db = openDatabase(DB_PATH);
   const registry = new AgentRegistry(db);
   const fs = new AgentFilesystem(db, registry, DATA);
@@ -30,6 +33,7 @@ function boot() {
   const workflows = new WorkflowService(db, registry, inbox);
   workflows.on("transition", (e) => console.log(`   [workflow] ${e.event.padEnd(18)} ${e.detail}`));
   supervisor.on("runtime-exit", (r) => console.log(`   [supervisor] ${registry.get(r.agentId)?.name}#${r.incarnation} → ${r.state}`));
+  defineReview?.(workflows);
   // Startup recovery, explicitly: close stale runtime records, release stale claims,
   // then let workflows catch up on anything that settled while nobody was listening.
   supervisor.recover();
@@ -63,28 +67,32 @@ p.fs.grant(extractor.id, artifacts, "write");
 p.fs.grant(backup.id, artifacts, "read");
 // Deliberately NOT granting `reviewer` access to artifacts: its step will fail.
 
+/** The workflow, as code: step inputs are functions of the workflow input and earlier results. */
+const defineReview = (w: WorkflowService) =>
+  w.register({
+    name: "review-document",
+    steps: [
+      {
+        name: "extract",
+        agents: [extractor.id],
+        task: "transform",
+        input: ({ input }) => ({ from: (input as { source: string }).source, to: `${artifacts}/extracted.txt`, delayMs: 600 }),
+      },
+      {
+        name: "review",
+        agents: [reviewer.id, backup.id],
+        task: "transform",
+        input: ({ steps }) => ({ from: (steps.extract as { path: string }).path, to: "~/reviewed.txt", suffix: "-- approved\n" }),
+      },
+    ],
+  });
+defineReview(p.workflows);
+
 let workflowId = "";
 try {
   step(1, "Start a two-step workflow. Only the extractor is running.");
   await p.supervisor.start(extractor.id);
-  const wf = p.workflows.start(
-    {
-      name: "review-document",
-      steps: [
-        {
-          name: "extract",
-          agents: [extractor.id],
-          payload: { task: "transform", input: { from: "{{input.source}}", to: `${artifacts}/extracted.txt`, delayMs: 600 } },
-        },
-        {
-          name: "review",
-          agents: [reviewer.id, backup.id],
-          payload: { task: "transform", input: { from: "{{steps.extract.path}}", to: "~/reviewed.txt", suffix: "-- approved\n" } },
-        },
-      ],
-    },
-    { source: `${docs}/source.txt` },
-  );
+  const wf = p.workflows.start("review-document", { source: `${docs}/source.txt` });
   workflowId = wf.id;
 
   step(2, "Crash the extractor mid-step, then bring it back");
@@ -99,7 +107,7 @@ try {
   await p.supervisor.stopAll();
   p.db.close();
   console.log("   (platform stopped: every service object discarded)");
-  p = boot();
+  p = boot(defineReview);
   const resumed = p.workflows.get(wf.id)!;
   const reviewStep = p.workflows.steps(wf.id)[1]!;
   console.log(

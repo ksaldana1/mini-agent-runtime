@@ -133,19 +133,64 @@ export const MIGRATIONS: readonly string[] = [
     detail      TEXT NOT NULL
   );
   `,
+
+  // 2: library phase 3: workflows and listeners are defined in code.
+  `
+  -- Workflows: the definition lives in code (registered by name every boot). The DB keeps
+  -- a fingerprint of it, to notice when the code changed under a running workflow.
+  ALTER TABLE workflows ADD COLUMN fingerprint TEXT;
+  ALTER TABLE workflows ADD COLUMN idempotency_key TEXT;
+  ALTER TABLE workflows DROP COLUMN definition;
+  CREATE UNIQUE INDEX workflows_idempotency ON workflows (name, idempotency_key);
+
+  -- Listeners: named (registration is an upsert by name), the target lives in code, and
+  -- the target agent is optional (NULL = platform-owned, e.g. it starts a workflow).
+  -- SQLite can't relax NOT NULL in place, so rebuild the table. Foreign keys are off
+  -- during migrations, so dropping the old table doesn't cascade into listener_files.
+  CREATE TABLE listeners_new (
+    id               TEXT PRIMARY KEY,
+    name             TEXT NOT NULL UNIQUE,
+    target_agent_id  TEXT REFERENCES agents(id),
+    path             TEXT NOT NULL,
+    events           TEXT NOT NULL,
+    state            TEXT NOT NULL,
+    created_at       TEXT NOT NULL,
+    last_scan_at     TEXT,
+    last_error       TEXT
+  );
+  INSERT INTO listeners_new (id, name, target_agent_id, path, events, state, created_at, last_scan_at, last_error)
+    SELECT id, 'legacy:' || id, target_agent_id, path, events, state, created_at, last_scan_at, last_error FROM listeners;
+  DROP TABLE listeners;
+  ALTER TABLE listeners_new RENAME TO listeners;
+  `,
 ];
 
-/** Apply any migrations not yet recorded in `user_version`. Returns how many ran. */
+/**
+ * Apply any migrations not yet recorded in `user_version`. Returns how many ran.
+ *
+ * Foreign keys are switched off while migrating (it can't be done inside a transaction),
+ * as SQLite recommends for schema changes that rebuild tables; each migration must leave
+ * `PRAGMA foreign_key_check` clean or it is rolled back.
+ */
 export function migrate(db: Db, migrations: readonly string[] = MIGRATIONS): number {
   const current = db.pragma("user_version", { simple: true }) as number;
   if (current > migrations.length) {
     throw new Error(`database schema version ${current} is newer than this code (${migrations.length})`);
   }
-  for (let v = current; v < migrations.length; v++) {
-    db.transaction(() => {
-      db.exec(migrations[v]!);
-      db.pragma(`user_version = ${v + 1}`);
-    })();
+  if (current === migrations.length) return 0;
+  const fkWasOn = db.pragma("foreign_keys", { simple: true }) === 1;
+  db.pragma("foreign_keys = OFF");
+  try {
+    for (let v = current; v < migrations.length; v++) {
+      db.transaction(() => {
+        db.exec(migrations[v]!);
+        const violations = db.pragma("foreign_key_check") as unknown[];
+        if (violations.length > 0) throw new Error(`migration ${v + 1} broke foreign keys: ${JSON.stringify(violations)}`);
+        db.pragma(`user_version = ${v + 1}`);
+      })();
+    }
+  } finally {
+    if (fkWasOn) db.pragma("foreign_keys = ON");
   }
   return migrations.length - current;
 }

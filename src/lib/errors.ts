@@ -53,3 +53,26 @@ export class TaskInputError extends Error {
     this.name = "TaskInputError";
   }
 }
+
+/** `startWorkflow()` refused the input: it doesn't match the workflow's schema. Nothing was started. */
+export class WorkflowInputError extends Error {
+  constructor(
+    readonly workflow: string,
+    message: string,
+  ) {
+    super(`invalid input for workflow ${workflow}: ${message}`);
+    this.name = "WorkflowInputError";
+  }
+}
+
+/** `WorkflowHandle.result()` rejects with this when the workflow ended up failed. */
+export class WorkflowFailedError extends Error {
+  constructor(
+    readonly workflowId: string,
+    readonly workflow: string,
+    readonly error: string | null,
+  ) {
+    super(`workflow ${workflow} (${workflowId}) failed: ${error ?? "unknown error"}`);
+    this.name = "WorkflowFailedError";
+  }
+}

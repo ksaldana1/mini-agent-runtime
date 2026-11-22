@@ -22,9 +22,9 @@ reloads Agent A from `data/platform.db` and continues its incarnation count.
 
 ## Library API (in progress)
 
-The platform is turning into a small library ([LIBRARY_PLAN.md](LIBRARY_PLAN.md)). Phases 0–2 are
-done: agents, typed sends, and events. Workflows and listeners defined in code come in Phase 3. The
-public entry point is the package itself (`"exports": "./src/lib/index.ts"`, run through `tsx`):
+The platform is turning into a small library ([LIBRARY_PLAN.md](LIBRARY_PLAN.md)). Phases 0–3 are
+done: agents, typed sends, events, and workflows and listeners defined in code. The public entry
+point is the package itself (`"exports": "./src/lib/index.ts"`, run through `tsx`):
 
 ```ts
 import { createPlatform } from "mini-agent-runtime";
@@ -39,6 +39,22 @@ const task = agent.send("save", { name: "a", text: "hello" }); // typed, validat
 const out = await task.result();                // resolves on settlement; no polling
 ```
 
+Workflows and listeners are code too, registered by name on every boot:
+
+```ts
+const review = platform.workflow("note-and-review")
+  .input(z.object({ name: z.string(), text: z.string() }))
+  .step("save", writer, "save", ({ input }) => ({ name: input.name, text: input.text }))
+  .step("review", [junior, senior], "read", ({ steps }) => ({ path: steps.save.path })) // typed
+  .build();
+
+platform.listen("submissions", { dir: "shared/documents/in" })
+  .startWorkflow(review, (file) => ({ name: file.name, text: file.path }));
+
+const run = platform.startWorkflow(review, { name: "memo", text: "hi" });
+const text = await run.result();                // the last step's output
+```
+
 - **Lifecycle.** `createPlatform` only wires the services. `start()` runs recovery (stale runtime rows,
   stale claims, workflow catch-up), starts listener scanning, then starts every `autostart` agent
   (the default). `close()` stops everything and closes the database; `await using` calls it.
@@ -49,6 +65,13 @@ const out = await task.result();                // resolves on settlement; no po
   (`TaskInputError`, nothing enqueued), then enqueues `{ task, input }` durably. `result()` resolves
   once the task completes, across crashes and redeliveries, or rejects with `TaskFailedError`.
   `platform.task(id)` reattaches to a task from an earlier process.
+- **Workflows** (`platform.workflow(name).input(schema).step(...).build()`) are typed end to end:
+  each step's input function sees the parsed workflow input and the outputs of the steps before it,
+  and must return the task's input type. `startWorkflow(ref, input, { idempotencyKey })` validates
+  the input (`WorkflowInputError`) and returns a `WorkflowHandle` (`status`, `steps`, `events`,
+  `result`). `platform.workflowRun(id)` reattaches.
+- **Listeners** (`platform.listen(name, { dir })`) either `.send(agent, task, fn)` (the agent must
+  be able to read `dir`) or `.startWorkflow(ref, fn)` (platform-owned, no permission check).
 - **Events.** `platform.events` re-emits kernel events with agent names. A complete timeline logger:
 
 ```ts
@@ -94,14 +117,14 @@ platform.events.onAny((name, e) => {
 | `src/platform/inbox.ts` | Durable inbox: `pending → claimed → completed / failed`. Idempotency keys, claims fenced by incarnation, retry limit, `"settled"` events and `waitFor`. Pure SQLite, no processes. |
 | `src/platform/dispatcher.ts` | Push delivery. Hands the oldest pending item to a running, idle runtime; releases claims when a runtime exits. |
 | `src/platform/filesystem.ts` | Platform-checked file access: path normalization, ownership + grants, audit log, atomic writes. |
-| `src/platform/listeners.ts` | Persistent subscriptions. Periodically scans watched directories against a saved snapshot and enqueues inbox items for new or changed files. |
-| `src/platform/workflows.ts` | Durable sequential workflows. Each step is an inbox item; progress comes from the item's stored status. Reassigns failed steps to fallback agents. |
-| `src/shared/template.ts` | `{{dotted.path}}` filling for listener and workflow payloads. |
+| `src/platform/listeners.ts` | Named, persistent subscriptions. Periodically scans watched directories against a saved snapshot; for new or changed files, calls the target registered in code (enqueue a task, or start a workflow). |
+| `src/platform/workflows.ts` | Durable sequential workflows defined in code. Each step is an inbox item; progress comes from the item's stored status. Reassigns failed steps to fallback agents. |
 | `src/runtime/host.ts` | The child process: a generic host. Starts anonymous; `INIT` tells it who it is and which agent module to import. Validates each `TASK`'s input with the named task's schema, runs the handler with a context (`ctx.fs` sends `FS_REQUEST` to the platform), and handles `PING` / `SHUTDOWN`. |
 | `src/lib/agent.ts` | `defineAgent(import.meta.url, { tasks })`: an agent's code. Typed tasks (Zod input schema + `run(input, ctx)`), `AgentContext`, and the `TaskNames` / `TaskInput` / `TaskOutput` helper types. |
 | `src/lib/errors.ts` | `PermanentError` and `FsDeniedError` (fail a task without retries); `TaskFailedError` and `TaskInputError` (thrown to callers). |
 | `src/lib/platform.ts` | `createPlatform`: wires the kernel, runs recovery in `start()`, and hands out typed `AgentHandle`s and `TaskHandle`s. |
 | `src/lib/events.ts` | `platform.events`: one typed emitter for everything observable, with agent names. |
+| `src/lib/workflows.ts` | The typed workflow builder, `WorkflowHandle`, and the listener builder. |
 | `src/lib/index.ts` | The public entry point. Exports the library, never kernel classes. |
 | `src/agents/toy.ts` | The toy agent the milestone demos use: `uppercase`, `transform`, and `fs` tasks. |
 
@@ -223,29 +246,32 @@ and another reason real isolation belongs in the OS.
 
 ### Listeners
 
-A listener is a stored rule: *when a file is created (or modified) under directory X, enqueue a task
-for agent A.* It is owned by the platform and never talks to a runtime:
+A listener is a named rule: *when a file is created (or modified) under directory X, do Y*, where Y
+is either "enqueue a task for agent A" or "start a run of workflow W". It is owned by the platform
+and never talks to a runtime:
 
 ```text
-filesystem ──scan──▶ ListenerService ──inbox.send──▶ Inbox ──Dispatcher──▶ runtime (whenever it's up)
-                        │
+filesystem ──scan──▶ ListenerService ──inbox.send──────────▶ Inbox ──Dispatcher──▶ runtime (whenever it's up)
+                        │          └──workflows.start──▶ WorkflowService ──▶ Inbox ...
                         └─ listener_files snapshot (SQLite)
 ```
+
+- **Code defines the target; SQLite holds the rest.** `register(name, { path, target })` is an upsert by name. The row and its snapshot survive restarts, so registering the same listener on the next boot doesn't refire for files already seen. If the path changes, the snapshot is reset to that directory's current contents. A stored listener whose target isn't registered in this process is skipped (reported once), and its snapshot doesn't advance, so it catches up once its code is registered again.
+- **Targets are functions, not templates.** An agent target computes the inbox payload from the file event (`{ listener, event, path, name }`). A platform target (`kind: "platform"`) is called inside the scan's transaction with the idempotency key, which is how `platform.listen(...).startWorkflow(...)` starts a run atomically with recording the file as seen. If a target throws for one file, that file is recorded as seen with an error (`lastError`, an `"error"` event), and the other files still fire.
 
 - **Periodic scan, not `fs.watch`.** Each pass lists the directory recursively and compares path, mtime, and size against the stored snapshot. Because the snapshot persists, files created while the platform was down are noticed on the next scan after it restarts. The cost is latency (up to `intervalMs`) and a full listing per scan.
 - **Two layers against duplicates:**
   1. The snapshot. A file version that was already seen produces no event, and enqueueing plus updating the snapshot happen in one transaction.
-  2. The inbox idempotency key (`listener:<id>:<event>:<path>:<mtime>`). Even if the snapshot is lost, the same file version can't create a second task.
+  2. The idempotency key (`listener:<name>:<event>:<path>:<mtime>`), used for the inbox item or the workflow run. Even if the snapshot is lost, the same file version can't create a second task or run.
 - **New files only, by default.** Files present at registration are recorded as already seen. Pass `includeExisting` to process them anyway.
 - **Settling.** Files modified within the last `settleMs` are skipped until a later scan, so a half-written file from an outside writer isn't processed. Files ending in `*.tmp` (the platform's own in-progress writes) are always ignored.
-- **Permissions.** A listener reveals file names and contents to its target, so registering one requires the target agent to have read access to the directory. Access is checked again on every scan: if the grant is revoked, or the agent is deleted or the listener paused, it stops firing and records `lastError`. A paused listener catches up on resume, because the snapshot wasn't advanced while it was paused.
-- **Payload templates.** `{{path}}`, `{{name}}`, `{{event}}`, and `{{listenerId}}` in string values are filled in, so a listener can enqueue a ready-to-run task (for example, `{ task: "transform", input: { from: "{{path}}", to: "~/processed/{{name}}" } }`). The default payload, `{ event, path, listenerId }`, is not a task, so a listener that delivers to a real agent needs a template.
+- **Permissions.** A listener reveals file names and contents to its target, so registering one with an agent target requires that agent to have read access to the directory (platform targets are exempt). Access is checked again on every scan: if the grant is revoked, or the agent is deleted or the listener paused, it stops firing and records `lastError`. A paused listener catches up on resume, because the snapshot wasn't advanced while it was paused.
 
 ### Workflows
 
-A workflow is a named list of steps. Each step names candidate agents (the first one, then
-fallbacks) and a payload template that can use `{{input.*}}`, `{{steps.<name>.*}}` (an earlier
-step's result), and `{{workflow.id}}`.
+A workflow is a named list of steps, defined in code and registered on every boot. Each step names
+candidate agents (the first one, then fallbacks), a task, and a function that computes the task's
+input from the workflow input, earlier steps' results, and the workflow id.
 
 ```text
 WorkflowService ──inbox.send──▶ Inbox ──Dispatcher──▶ runtime
@@ -254,6 +280,9 @@ WorkflowService ──inbox.send──▶ Inbox ──Dispatcher──▶ runtim
       └──── recover() at startup (reconcileAll)
 ```
 
+- **Code defines the steps; SQLite holds the progress** (D1). A run stores its workflow's name and a **fingerprint** (a hash of step names, tasks, and candidate agent names), never the definition. On reconcile, a run whose workflow isn't registered in this process is skipped (`"skipped"`); one whose registered definition has a different fingerprint is failed with `definition changed`. Input functions aren't part of the fingerprint, so changing *how* an input is computed is fine.
+- **Nothing is replayed.** A step's input function runs once, when the step is assigned, and its result is stored in the inbox item. If it throws, the workflow fails.
+- **Idempotent starts.** `start(name, input, { idempotencyKey })`: a repeat start of the same workflow with the same key returns the original run. `waitFor(id)` resolves once a run completes or fails.
 - **Workflows sit on top of the inbox.** A workflow never talks to a runtime. Assigning a step means `inbox.send` with the idempotency key `workflow:<id>:step:<n>:assignment:<k>`. Delivery, crash redelivery, and retry limits all come from the inbox and dispatcher.
 - **Progress comes from stored state.** `reconcile()` looks at the current step's inbox item. If it's `completed`, the result is saved and the next step is assigned (or the workflow completes). If it's `failed`, the step goes to the next candidate agent (or the workflow fails). If it's pending or claimed, nothing happens. Because it only reads the database, calling it repeatedly is safe, and each transition runs in one transaction.
 - **Events for speed, a startup pass for recovery.** The inbox's `"settled"` event triggers `reconcile` immediately, including when a crash release is what failed the item. On startup, `recover()` catches anything that finished while no service was listening.

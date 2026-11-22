@@ -17,10 +17,24 @@ import { AgentRegistry } from "../platform/identity.js";
 import { Inbox, type InboxItem } from "../platform/inbox.js";
 import { ListenerService } from "../platform/listeners.js";
 import { Supervisor, type RestartPolicy, type RuntimeInfo, type RuntimeRecord, type RuntimeState } from "../platform/supervisor.js";
-import { WorkflowService, type WorkflowEvent } from "../platform/workflows.js";
+import { WorkflowService, type Workflow, type WorkflowEvent } from "../platform/workflows.js";
+import type { Listener } from "../platform/listeners.js";
 import { isAgentDefinition, type Access, type AgentDefinition, type TaskInput, type TaskNames, type TaskOutput } from "./agent.js";
 import { TaskFailedError, TaskInputError } from "./errors.js";
 import { PlatformEventEmitter, type TaskStatus } from "./events.js";
+import {
+  ListenerHandleImpl,
+  toFileEvent,
+  toKernelStep,
+  validateWorkflowInput,
+  WorkflowHandleImpl,
+  WorkflowStart,
+  type ListenerBuilder,
+  type ListenerHandle,
+  type ListenOptions,
+  type WorkflowHandle,
+  type WorkflowRef,
+} from "./workflows.js";
 
 // ── Public types ────────────────────────────────────────────────────────────
 
@@ -127,6 +141,8 @@ export class Platform implements AsyncDisposable {
   private lifecycle: Lifecycle = "created";
   private readonly handles = new Map<string, AgentHandleImpl<AgentDefinition>>();
   private readonly autostart = new Set<string>();
+  private readonly workflowSchemas = new Map<string, z.ZodType>();
+  private readonly listenerNames = new Set<string>();
 
   constructor(opts: PlatformOptions) {
     const db = openDatabase(opts.dbPath ?? join(opts.dataDir, "platform.db"));
@@ -173,6 +189,96 @@ export class Platform implements AsyncDisposable {
     }
     return handle;
   }
+
+  // ── Workflows ─────────────────────────────────────────────────────────────
+
+  /**
+   * Define a workflow: `.input(schema)`, then `.step(...)` for each step, then `.build()`.
+   * Like agents, workflows are registered by name on every boot; running workflows pick up
+   * the registered definition (and fail with "definition changed" if its steps changed).
+   */
+  workflow(name: string): WorkflowStart {
+    this.assertOpen();
+    return new WorkflowStart(this, name);
+  }
+
+  /**
+   * Start a run of a workflow. The input is validated first (WorkflowInputError, nothing
+   * started). With the same idempotencyKey, a repeat start returns the original run.
+   */
+  startWorkflow<In, Out>(workflow: WorkflowRef<In, Out>, input: In, opts: { idempotencyKey?: string } = {}): WorkflowHandle<Out> {
+    this.assertOpen();
+    const schema = this.workflowSchemas.get(workflow.name);
+    if (!schema) throw new Error(`workflow ${workflow.name} is not registered in this platform`);
+    validateWorkflowInput(workflow.name, schema, input);
+    const run = this.kernel.workflows.start(workflow.name, input, opts);
+    return new WorkflowHandleImpl<Out>(this, run.id);
+  }
+
+  /** Reattach to a workflow run by id, e.g. one started by an earlier process. */
+  workflowRun<Out = unknown>(id: string): WorkflowHandle<Out> {
+    this.assertOpen();
+    return new WorkflowHandleImpl<Out>(this, id);
+  }
+
+  /** @internal Called by WorkflowBuilder.build(). */
+  registerWorkflow(name: string, schema: z.ZodType, specs: Parameters<typeof toKernelStep>[2][]): void {
+    this.assertOpen();
+    if (this.workflowSchemas.has(name)) throw new Error(`workflow "${name}" is already registered in this process`);
+    if (specs.length === 0) throw new Error(`workflow "${name}" needs at least one step`);
+    this.kernel.workflows.register({ name, steps: specs.map((s) => toKernelStep(name, schema, s)) });
+    this.workflowSchemas.set(name, schema);
+    // Registered after start(): let runs of this workflow catch up right away.
+    if (this.lifecycle === "started") this.kernel.workflows.recover();
+  }
+
+  // ── Listeners ─────────────────────────────────────────────────────────────
+
+  /**
+   * Watch a directory. Pick a target with `.send(agent, task, fn)` or
+   * `.startWorkflow(workflow, fn)`. Registration is by name and survives restarts: files
+   * already seen don't fire again. Changing `dir` resets what has been seen.
+   */
+  listen(name: string, opts: ListenOptions): ListenerBuilder {
+    this.assertOpen();
+    if (this.listenerNames.has(name)) throw new Error(`listener "${name}" is already registered in this process`);
+    const register = (target: Parameters<ListenerService["register"]>[1]["target"]): ListenerHandle => {
+      if (this.listenerNames.has(name)) throw new Error(`listener "${name}" is already registered in this process`);
+      const l: Listener = this.kernel.listeners.register(name, { path: opts.dir, events: opts.events, includeExisting: opts.includeExisting, target });
+      this.listenerNames.add(name);
+      return new ListenerHandleImpl(this, name, l.id);
+    };
+    return {
+      send: (agent, task, input) => {
+        const def = Object.hasOwn(agent.definition.tasks, task) ? agent.definition.tasks[task] : undefined;
+        if (!def) throw new Error(`listener ${name}: agent ${agent.name} has no task "${task}"`);
+        return register({
+          kind: "agent",
+          agentId: agent.id,
+          payload: (e) => {
+            const value = input(toFileEvent(e));
+            const parsed = def.input.safeParse(value);
+            if (!parsed.success) throw new TaskInputError(task, agent.name, z.prettifyError(parsed.error));
+            return { task, input: value };
+          },
+        });
+      },
+      startWorkflow: (workflow, input) => {
+        const schema = this.workflowSchemas.get(workflow.name);
+        if (!schema) throw new Error(`listener ${name}: workflow ${workflow.name} is not registered in this platform`);
+        return register({
+          kind: "platform",
+          fire: (e: Parameters<typeof toFileEvent>[0], idempotencyKey: string) => {
+            const value = input(toFileEvent(e));
+            validateWorkflowInput(workflow.name, schema, value);
+            return this.kernel.workflows.start(workflow.name, value, { idempotencyKey }).id;
+          },
+        });
+      },
+    };
+  }
+
+  // ── Tasks ─────────────────────────────────────────────────────────────────
 
   /** Reattach to a task by id, e.g. one created by an earlier process. */
   task<Out = unknown>(id: string): TaskHandle<Out> {
@@ -311,18 +417,32 @@ export class Platform implements AsyncDisposable {
         error: item.status === "failed" ? item.lastError : null,
       }),
     );
-    listeners.on("fired", ({ listener, event, path, item }: { listener: { id: string; targetAgentId: string }; event: string; path: string; item: InboxItem }) =>
+    listeners.on("fired", ({ listener, event, path, item, result }: { listener: Listener; event: string; path: string; item?: InboxItem; result?: unknown }) =>
       e.emit("listener.fired", {
+        listener: listener.name,
         listenerId: listener.id,
-        agent: this.nameOf(listener.targetAgentId),
-        agentId: listener.targetAgentId,
         event,
         path,
-        taskId: item.id,
+        agent: listener.targetAgentId && this.nameOf(listener.targetAgentId),
+        agentId: listener.targetAgentId,
+        taskId: item?.id ?? null,
+        workflowId: typeof result === "string" ? result : null,
       }),
+    );
+    listeners.on("error", ({ listener, path, error }: { listener: Listener; path: string; error: Error }) =>
+      e.emit("listener.error", { listener: listener.name, path, error: error.message }),
+    );
+    listeners.on("skipped", ({ listener, reason }: { listener: Listener; reason: string }) =>
+      e.emit("listener.skipped", { listener: listener.name, reason }),
     );
     workflows.on("transition", (w: WorkflowEvent) =>
       e.emit("workflow.transition", { workflowId: w.workflowId, workflow: workflows.get(w.workflowId)?.name ?? "?", event: w.event, detail: w.detail }),
+    );
+    workflows.on("settled", (w: Workflow) =>
+      e.emit("workflow.settled", { workflowId: w.id, workflow: w.name, status: w.status as "completed" | "failed", output: w.output, error: w.error }),
+    );
+    workflows.on("skipped", (w: { workflowId: string; name: string; reason: string }) =>
+      e.emit("workflow.skipped", { workflowId: w.workflowId, workflow: w.name, reason: w.reason }),
     );
     fs.on("denied", (a: AuditEntry) => e.emit("fs.denied", { agent: this.nameOf(a.agentId), agentId: a.agentId, op: a.op, path: a.path, reason: a.reason }));
   }

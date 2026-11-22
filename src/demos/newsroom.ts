@@ -20,7 +20,7 @@ import { AgentRegistry, type Agent } from "../platform/identity.js";
 import { Inbox } from "../platform/inbox.js";
 import { ListenerService } from "../platform/listeners.js";
 import { Supervisor } from "../platform/supervisor.js";
-import { WorkflowService, type WorkflowDefinition } from "../platform/workflows.js";
+import { WorkflowService } from "../platform/workflows.js";
 import toy from "../agents/toy.js";
 
 // ── Platform ────────────────────────────────────────────────────────────────
@@ -81,37 +81,44 @@ fs.grant(editor.id, desk, "read");
 
 // ── Wiring ──────────────────────────────────────────────────────────────────
 
-listeners.register(intake.id, submissions, {
-  payloadTemplate: { task: "transform", input: { from: "{{path}}", to: `${desk}/{{name}}` } },
+listeners.register(`submissions-${run}`, {
+  path: submissions,
+  target: { kind: "agent", agentId: intake.id, payload: (e) => ({ task: "transform", input: { from: e.path, to: `${desk}/${e.name}` } }) },
 });
 
-const pipeline: WorkflowDefinition = {
-  name: "publish-article",
+type Doc = { path: string; name: string };
+const editedPath = (steps: Record<string, unknown>) => (steps.edit as { path: string }).path;
+const PIPELINE = `publish-article-${run}`;
+workflows.register({
+  name: PIPELINE,
   steps: [
     {
       name: "edit",
       agents: [editor.id],
-      payload: { task: "transform", input: { from: "{{input.path}}", to: "~/edited/{{input.name}}.txt", suffix: "\n[edited]", delayMs: 250 } },
+      task: "transform",
+      input: ({ input }) => ({ from: (input as Doc).path, to: `~/edited/${(input as Doc).name}.txt`, suffix: "\n[edited]", delayMs: 250 }),
     },
     {
       name: "share",
       agents: [editor.id],
-      payload: { task: "fs", input: { request: { op: "share", path: "{{steps.edit.path}}", agentId: senior.id, access: "read" } } },
+      task: "fs",
+      input: ({ steps }) => ({ request: { op: "share", path: editedPath(steps), agentId: senior.id, access: "read" } }),
     },
     {
       name: "review",
       agents: [junior.id, senior.id],
-      payload: { task: "transform", input: { from: "{{steps.edit.path}}", to: "~/approved/{{input.name}}.txt", suffix: "\n[approved]" } },
+      task: "transform",
+      input: ({ input, steps }) => ({ from: editedPath(steps), to: `~/approved/${(input as Doc).name}.txt`, suffix: "\n[approved]" }),
     },
   ],
-};
+});
 
 // Glue (demo-level, not a platform feature): finished intake → start the article's workflow.
 dispatcher.on("completed", ({ item, result }) => {
   if (item.recipientAgentId !== intake.id) return;
   const path = (result as { path: string }).path;
   log("glue", `intake finished ${article(path)} → starting workflow`);
-  workflows.start(pipeline, { path, name: article(path) });
+  workflows.start(PIPELINE, { path, name: article(path) });
 });
 
 // Chaos: kill the editor in the middle of its first edit.
@@ -149,7 +156,7 @@ try {
   await supervisor.start(senior.id);
 
   const deadline = Date.now() + 20_000;
-  const mine = () => workflows.list().filter((w) => w.definition.steps[0]!.agents[0] === editor.id);
+  const mine = () => workflows.list().filter((w) => w.name === PIPELINE);
   while (!(mine().length === 3 && mine().every((w) => w.status !== "running"))) {
     if (Date.now() > deadline) throw new Error("timed out waiting for workflows");
     await sleep(50);

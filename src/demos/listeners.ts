@@ -29,7 +29,7 @@ const LISTENER_OPTS = { intervalMs: 200, settleMs: 50 };
 const makeListeners = () => {
   const svc = new ListenerService(db, registry, fs, inbox, LISTENER_OPTS);
   svc.on("fired", ({ event, path, item }) => console.log(`   [listener] ${event} ${tail(path)} → inbox item ${item.id.slice(0, 8)}`));
-  svc.on("skipped", ({ reason }) => console.log(`   [listener] skipped: ${reason}`));
+  svc.on("skipped", ({ listener, reason }) => listener.name === LISTENER && console.log(`   [listener] skipped: ${reason}`));
   return svc;
 };
 
@@ -50,6 +50,13 @@ async function until(cond: () => boolean, timeoutMs = 10_000) {
 }
 
 const agent = registry.create(`indexer-${run}`);
+/** Code supplies the listener's target on every boot; the registration and snapshot live in SQLite. */
+const LISTENER = `incoming-${run}`;
+const register = (svc: ListenerService) =>
+  svc.register(LISTENER, {
+    path: watched,
+    target: { kind: "agent", agentId: agent.id, payload: (e) => ({ task: "transform", input: { from: e.path, to: `~/processed/${e.name}` } }) },
+  });
 const counts = () => {
   const all = inbox.list(agent.id);
   return `pending=${all.filter((i) => i.status === "pending").length} completed=${all.filter((i) => i.status === "completed").length}`;
@@ -62,11 +69,9 @@ try {
 
   step(1, `Grant the agent read on ${watched} and register a listener`);
   fs.grant(agent.id, watched, "read");
-  const listener = listeners.register(agent.id, watched, {
-    payloadTemplate: { task: "transform", input: { from: "{{path}}", to: "~/processed/{{name}}" } },
-  });
+  const listener = register(listeners);
   listeners.start();
-  console.log(`   listener ${listener.id.slice(0, 8)}; agent runtime: ${supervisor.status(agent.id)?.state ?? "none"}`);
+  console.log(`   listener ${listener.name}; agent runtime: ${supervisor.status(agent.id)?.state ?? "none"}`);
 
   step(2, "Files arrive while the agent is offline");
   drop("a.txt", "alpha");
@@ -79,7 +84,8 @@ try {
   console.log("   (listener service stopped)");
   drop("c.txt", "charlie");
   await sleep(300);
-  listeners = makeListeners(); // fresh instance: all state comes from SQLite
+  listeners = makeListeners(); // fresh instance: all state comes from SQLite...
+  register(listeners); // ...except the target, which code registers again (same name: snapshot kept)
   listeners.start();
   await until(() => inbox.list(agent.id).length === 3);
   console.log(`   inbox: ${counts()}`);

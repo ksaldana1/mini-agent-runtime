@@ -563,7 +563,6 @@ All five milestones are implemented (see README). This section records what the 
 
 **Agent code**
 - Agent modules are imported by both the platform and every runtime, so they must be side-effect free at the top level. Nothing enforces this.
-- A listener's default payload (`{ event, path, listenerId }`) isn't a task, so it fails permanently if delivered. Listeners need a `{ task, input }` template until Phase 3 of the library plan adds code-defined targets.
 
 **Library API**
 - An agent's name is its identity. Renaming an agent in code creates a new agent with an empty inbox and directory; the old one lingers in the database.
@@ -588,18 +587,22 @@ All five milestones are implemented (see README). This section records what the 
 - Listeners only watch files: no timers, no agent-to-agent events, and deleted files aren't reported.
 - Changes are detected by modification time and size, so a rewrite that keeps both the same is missed.
 - Every scan lists the whole watched tree, which gets slow for large trees. `fs.watch` could later act as a "scan now" hint on top of the stored snapshot, without becoming the source of truth.
+- Listeners whose code is gone (a name no longer registered) stay in the database. They're reported once per process and otherwise ignored; there is no cleanup.
+- If a listener's target throws for a file (e.g. it computes invalid input), that file version is recorded as seen and not retried.
 
 **Workflows**
 - Sequential only: no branching, parallel steps, timers, or cancellation.
 - Steps have no deadline. A step assigned to an agent that never starts waits forever, because reassignment only happens after a failure.
-- Step outputs have no schema. A template that refers to a missing field is left unfilled.
+- Changing a workflow's steps (names, tasks, or candidate agents) fails its running workflows with `definition changed`. There is no migration or versioning of in-flight runs yet.
+- A running workflow whose definition is no longer registered just waits; nothing cleans it up.
+- Step outputs are typed from the task's return type, but not validated at runtime.
 
 **Development**
 - Runtimes are started with `--import tsx` and there is no build step. That keeps development simple, but every runtime pays TypeScript transpilation cost at startup.
 
 ### Next Steps
 
-1. **Library API.** In progress; see [LIBRARY_PLAN.md](LIBRARY_PLAN.md). Phase 0 (migrations, settlement events, permanent errors, explicit recovery, restart policies) Phase 1 (`defineAgent`, the generic runtime host, `AgentContext`), and Phase 2 (`createPlatform`, typed handles and `send`, events) are done.
+1. **Library API.** In progress; see [LIBRARY_PLAN.md](LIBRARY_PLAN.md). Phase 0 (migrations, settlement events, permanent errors, explicit recovery, restart policies) Phase 1 (`defineAgent`, the generic runtime host, `AgentContext`), Phase 2 (`createPlatform`, typed handles and `send`, events), and Phase 3 (workflows and listeners defined in code) are done.
 2. **Step deadlines.** Give each workflow step a timeout that triggers reassignment to the next candidate agent, so a step held by an agent that never runs doesn't block the workflow.
 3. **Agent-initiated messaging and listeners.** Add IPC messages that let runtimes send inbox messages and register listeners, with a check on who may send to whom.
 4. **OS-enforced isolation.** Give each agent its own Unix user (or namespace/container), and turn platform grants into real file ownership, POSIX permissions, or ACLs, so the kernel enforces access instead of TypeScript.

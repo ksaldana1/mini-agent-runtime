@@ -28,8 +28,26 @@ export interface PlatformEvents {
     result: unknown;
     error: string | null;
   };
-  "listener.fired": { listenerId: string; agent: string; agentId: string; event: string; path: string; taskId: string };
+  /** A listener fired: either enqueued a task for its agent, or started a workflow. */
+  "listener.fired": {
+    listener: string;
+    listenerId: string;
+    event: string;
+    path: string;
+    /** Target agent; null for a listener that starts a workflow. */
+    agent: string | null;
+    agentId: string | null;
+    taskId: string | null;
+    workflowId: string | null;
+  };
+  /** A listener's target threw for one file (e.g. it computed invalid input). The file is not retried. */
+  "listener.error": { listener: string; path: string; error: string };
+  /** A listener was skipped this scan (no target registered, agent lost access, ...). */
+  "listener.skipped": { listener: string; reason: string };
   "workflow.transition": { workflowId: string; workflow: string; event: string; detail: string };
+  "workflow.settled": { workflowId: string; workflow: string; status: "completed" | "failed"; output: unknown; error: string | null };
+  /** A running workflow can't progress in this process: its definition isn't registered. */
+  "workflow.skipped": { workflowId: string; workflow: string; reason: string };
   "fs.denied": { agent: string; agentId: string; op: string; path: string; reason: string };
 }
 

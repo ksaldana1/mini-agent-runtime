@@ -10,20 +10,7 @@ import { AgentRegistry, type Agent } from "../src/platform/identity.js";
 import { Inbox } from "../src/platform/inbox.js";
 import { Supervisor } from "../src/platform/supervisor.js";
 import { WorkflowService, type WorkflowDefinition } from "../src/platform/workflows.js";
-import { renderTemplate } from "../src/shared/template.js";
 import toy from "../src/agents/toy.js";
-
-describe("renderTemplate", () => {
-  it("fills dotted placeholders, keeping raw values for whole-string placeholders", () => {
-    const vars = { input: { n: 3, s: "x" }, steps: { a: { path: "p/q" } } };
-    expect(renderTemplate({ n: "{{input.n}}", msg: "n={{input.n}} s={{input.s}}", p: ["{{steps.a.path}}"], k: "{{nope}}" }, vars)).toEqual({
-      n: 3,
-      msg: "n=3 s=x",
-      p: ["p/q"],
-      k: "{{nope}}",
-    });
-  });
-});
 
 /**
  * No runtimes here: the tests play the agent's part by claiming/completing inbox
@@ -40,13 +27,20 @@ describe("WorkflowService (state machine over the inbox)", () => {
   let b: Agent;
   let c: Agent;
 
+  type Ctx = { input: { text?: string }; steps: { first?: { out: string } }; workflow: { id: string } };
   const def = (): WorkflowDefinition => ({
     name: "two-step",
     steps: [
-      { name: "first", agents: [a.id], payload: { task: "uppercase", input: { text: "{{input.text}}" } } },
-      { name: "second", agents: [b.id, c.id], payload: { task: "transform", input: { from: "{{steps.first.out}}", wf: "{{workflow.id}}" } } },
+      { name: "first", agents: [a.id], task: "uppercase", input: (ctx) => ({ text: (ctx as Ctx).input.text }) },
+      {
+        name: "second",
+        agents: [b.id, c.id],
+        task: "transform",
+        input: (ctx) => ({ from: (ctx as Ctx).steps.first!.out, wf: ctx.workflow.id }),
+      },
     ],
   });
+  const start = (input: unknown = {}) => workflows.start("two-step", input);
 
   /** Simulate an agent finishing (or failing) whatever is assigned to it. */
   const finish = (agent: Agent, result: unknown) => {
@@ -72,20 +66,19 @@ describe("WorkflowService (state machine over the inbox)", () => {
     a = registry.create("a");
     b = registry.create("b");
     c = registry.create("c");
+    workflows.register(def());
   });
 
-  it("validates definitions", () => {
-    expect(() => workflows.start({ name: "x", steps: [] })).toThrow();
-    expect(() =>
-      workflows.start({ name: "x", steps: [{ name: "s", agents: [a.id], payload: 1 }, { name: "s", agents: [a.id], payload: 2 }] }),
-    ).toThrow(/unique/);
-    expect(() => workflows.start({ name: "x", steps: [{ name: "s", agents: ["00000000-0000-0000-0000-000000000000"], payload: 1 }] })).toThrow(
-      /unknown agent/,
-    );
+  it("validates definitions on registration", () => {
+    const step = (name: string, agents = [a.id]) => ({ name, agents, task: "t", input: () => ({}) });
+    expect(() => workflows.register({ name: "x", steps: [] })).toThrow(/at least one step/);
+    expect(() => workflows.register({ name: "x", steps: [step("s"), step("s")] })).toThrow(/unique/);
+    expect(() => workflows.register({ name: "x", steps: [step("s", ["00000000-0000-0000-0000-000000000000"])] })).toThrow(/unknown agent/);
+    expect(() => workflows.start("never-registered")).toThrow(/not registered/);
   });
 
-  it("assigns the first step as an inbox item with a rendered payload", () => {
-    const wf = workflows.start(def(), { text: "hi" });
+  it("assigns the first step as an inbox item with the computed input", () => {
+    const wf = start({ text: "hi" });
     expect(wf).toMatchObject({ status: "running", currentStep: 0 });
     const [item] = inbox.list(a.id);
     expect(item).toMatchObject({ payload: { task: "uppercase", input: { text: "hi" } }, idempotencyKey: `workflow:${wf.id}:step:0:assignment:1` });
@@ -93,7 +86,7 @@ describe("WorkflowService (state machine over the inbox)", () => {
   });
 
   it("advances step by step, passing results forward, and completes", () => {
-    const wf = workflows.start(def(), { text: "hi" });
+    const wf = start({ text: "hi" });
     finish(a, { out: "a/out.txt" });
     workflows.reconcile(wf.id);
 
@@ -114,7 +107,7 @@ describe("WorkflowService (state machine over the inbox)", () => {
   });
 
   it("does nothing while the step's item is pending or claimed", () => {
-    const wf = workflows.start(def(), {});
+    const wf = start();
     expect(workflows.reconcile(wf.id)).toBe(false);
     inbox.claimNext(a.id, 1);
     expect(workflows.reconcile(wf.id)).toBe(false);
@@ -122,7 +115,7 @@ describe("WorkflowService (state machine over the inbox)", () => {
   });
 
   it("reconcile is idempotent", () => {
-    const wf = workflows.start(def(), {});
+    const wf = start();
     finish(a, { out: "x" });
     for (let i = 0; i < 5; i++) workflows.reconcile(wf.id);
     workflows.reconcileAll();
@@ -131,7 +124,7 @@ describe("WorkflowService (state machine over the inbox)", () => {
   });
 
   it("reassigns a failed step to the next candidate agent", () => {
-    const wf = workflows.start(def(), {});
+    const wf = start();
     finish(a, { out: "x" });
     workflows.reconcile(wf.id);
 
@@ -147,7 +140,7 @@ describe("WorkflowService (state machine over the inbox)", () => {
 
   it("advances on its own when the inbox settles a step's item, including via crash release", async () => {
     const tick = () => new Promise<void>((r) => setImmediate(r));
-    const wf = workflows.start(def(), {});
+    const wf = start();
     finish(a, { out: "x" }); // no reconcile() call: the "settled" event drives it
     await tick();
     expect(workflows.steps(wf.id)[1]).toMatchObject({ status: "assigned", agentId: b.id });
@@ -162,7 +155,7 @@ describe("WorkflowService (state machine over the inbox)", () => {
   });
 
   it("fails the workflow when no candidates are left", () => {
-    const wf = workflows.start(def(), {});
+    const wf = start();
     failHard(a);
     workflows.reconcile(wf.id);
     expect(workflows.get(wf.id)).toMatchObject({ status: "failed", error: expect.stringMatching(/no candidate/) });
@@ -172,7 +165,7 @@ describe("WorkflowService (state machine over the inbox)", () => {
 
   it("skips candidates that have been deleted", () => {
     registry.markDeleted(b.id);
-    const wf = workflows.start(def(), {});
+    const wf = start();
     finish(a, { out: "x" });
     workflows.reconcile(wf.id);
     expect(workflows.steps(wf.id)[1]).toMatchObject({ agentId: c.id, assignment: 2 });
@@ -180,16 +173,72 @@ describe("WorkflowService (state machine over the inbox)", () => {
   });
 
   it("recovers on startup: progress made while no workflow service was listening is picked up", () => {
-    const wf = workflows.start(def(), {});
+    const wf = start();
     // The step finishes, but the "completed" event is never observed (platform died).
     finish(a, { out: "x" });
     expect(workflows.get(wf.id)!.currentStep).toBe(0);
 
     const restarted = new WorkflowService(db, registry, inbox);
     expect(restarted.get(wf.id)!.currentStep).toBe(0); // constructing doesn't recover
+    // Code supplies the definition on every boot. Until it's registered, the run waits.
+    const skipped: unknown[] = [];
+    restarted.on("skipped", (e) => skipped.push(e));
+    expect(restarted.recover()).toBe(0);
+    expect(skipped).toMatchObject([{ workflowId: wf.id, name: "two-step", reason: expect.stringMatching(/not registered/) }]);
+    restarted.register(def());
     expect(restarted.recover()).toBe(1);
     expect(restarted.get(wf.id)!.currentStep).toBe(1);
     expect(restarted.recover()).toBe(0);
+  });
+
+  it("fails a running workflow whose registered definition changed", () => {
+    const wf = start();
+    const restarted = new WorkflowService(db, registry, inbox);
+    const changed = def();
+    changed.steps[1]!.agents = [c.id]; // different candidates → different fingerprint
+    restarted.register(changed);
+    expect(restarted.recover()).toBe(1);
+    expect(restarted.get(wf.id)).toMatchObject({ status: "failed", error: "definition changed" });
+  });
+
+  it("the fingerprint ignores input functions: changing how inputs are computed is fine", () => {
+    const wf = start({ text: "x" });
+    finish(a, { out: "o" });
+    const restarted = new WorkflowService(db, registry, inbox);
+    const tweaked = def();
+    tweaked.steps[1]!.input = () => ({ from: "tweaked" });
+    restarted.register(tweaked);
+    restarted.recover();
+    expect(restarted.get(wf.id)).toMatchObject({ status: "running", currentStep: 1 });
+    expect(inbox.list(b.id)[0]!.payload).toEqual({ task: "transform", input: { from: "tweaked" } });
+  });
+
+  it("dedupes starts by idempotency key, per workflow name", () => {
+    const one = workflows.start("two-step", {}, { idempotencyKey: "k" });
+    const two = workflows.start("two-step", { other: true }, { idempotencyKey: "k" });
+    expect(two.id).toBe(one.id);
+    expect(workflows.list()).toHaveLength(1);
+    workflows.register({ ...def(), name: "other" });
+    expect(workflows.start("other", {}, { idempotencyKey: "k" }).id).not.toBe(one.id);
+  });
+
+  it("an input function that throws fails the workflow", () => {
+    workflows.register({ name: "bad", steps: [{ name: "s", agents: [a.id], task: "t", input: () => { throw new Error("no path"); } }] });
+    const wf = workflows.start("bad");
+    expect(wf).toMatchObject({ status: "failed", error: expect.stringMatching(/computing its input failed: no path/) });
+    expect(inbox.list(a.id)).toHaveLength(0);
+  });
+
+  it("waitFor resolves on completion, and immediately for a finished run", async () => {
+    const wf = start();
+    const waiting = workflows.waitFor(wf.id);
+    finish(a, { out: "x" });
+    workflows.reconcile(wf.id);
+    finish(b, "done");
+    workflows.reconcile(wf.id);
+    await expect(waiting).resolves.toMatchObject({ status: "completed", output: "done" });
+    await expect(workflows.waitFor(wf.id)).resolves.toMatchObject({ status: "completed" });
+    await expect(workflows.waitFor("nope")).rejects.toThrow(/unknown workflow/);
   });
 });
 
@@ -222,13 +271,19 @@ describe("Workflows end to end (real runtimes)", () => {
     fs.grant(worker.id, "shared/documents", "read");
 
     const first = await supervisor.start(worker.id);
-    const wf = workflows.start({
+    workflows.register({
       name: "e2e",
       steps: [
-        { name: "copy", agents: [worker.id], payload: { task: "transform", input: { from: "{{input.src}}", to: "~/a.txt", delayMs: 200 } } },
-        { name: "again", agents: [worker.id], payload: { task: "transform", input: { from: "{{steps.copy.path}}", to: "~/b.txt", suffix: "!" } } },
+        { name: "copy", agents: [worker.id], task: "transform", input: (ctx) => ({ from: (ctx.input as { src: string }).src, to: "~/a.txt", delayMs: 200 }) },
+        {
+          name: "again",
+          agents: [worker.id],
+          task: "transform",
+          input: (ctx) => ({ from: (ctx.steps.copy as { path: string }).path, to: "~/b.txt", suffix: "!" }),
+        },
       ],
-    }, { src: "shared/documents/in.txt" });
+    });
+    const wf = workflows.start("e2e", { src: "shared/documents/in.txt" });
 
     const deadline = () => Date.now() + 5_000;
     let d = deadline();
