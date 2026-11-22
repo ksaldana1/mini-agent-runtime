@@ -579,12 +579,15 @@ All five milestones are implemented (see README). This section records what the 
 - Only the platform can register listeners. Agents can't create their own.
 - Listeners only watch files: no timers, no agent-to-agent events, and deleted files aren't reported.
 - Changes are detected by modification time and size, so a rewrite that keeps both the same is missed.
-- Every scan lists the whole watched tree, which gets slow for large trees.
+- Every scan lists the whole watched tree, which gets slow for large trees. `fs.watch` could later act as a "scan now" hint on top of the stored snapshot, without becoming the source of truth.
 
 **Workflows**
 - Sequential only: no branching, parallel steps, timers, or cancellation.
 - Steps have no deadline. A step assigned to an agent that never starts waits forever, because reassignment only happens after a failure.
 - Step outputs have no schema. A template that refers to a missing field is left unfilled.
+
+**Development**
+- Runtimes are started with `--import tsx` and there is no build step. That keeps development simple, but every runtime pays TypeScript transpilation cost at startup.
 
 ### Next Steps
 

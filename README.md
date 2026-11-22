@@ -158,21 +158,6 @@ WorkflowService ──inbox.send──▶ Inbox ──Dispatcher──▶ runtim
 - **Two levels of retry:** retrying *the same agent* (crash or error, up to `maxAttempts`) is the inbox's job. Moving work *to a different agent* is the workflow's job.
 - **Workflow state stays separate from agent state.** Agents don't know they are part of a workflow; they just get tasks. All progress lives in `workflows`, `workflow_steps`, and `workflow_events` (an append-only list of transitions).
 
-## Trade-offs and limitations
+## Limitations and next steps
 
-- **Not a sandbox.** `fork()` gives a separate process, not a security boundary. Runtimes are trusted code.
-- **No automatic restart policy.** The supervisor *detects* crashes (`runtime-exit` event, `state: crashed`) but restarting is the caller's decision. An Erlang-style restart strategy is a natural next step.
-- **Graceful stop counts as an attempt.** `stop()` doesn't wait for the in-flight task to finish. The claim is released and the item is redelivered, using one attempt.
-- **Agents can't send messages yet.** Only the platform calls `inbox.send` (optionally *on behalf of* a sender). Letting runtimes send needs a new protocol message and a send-permission check.
-- **No dead-letter handling beyond `failed`.** Failed items just sit there with `lastError`.
-- **FIFO per agent, no priorities.**
-- **Permanent errors are retried.** A task that fails with `EACCES` is retried like any other error. There's no distinction yet between retryable and permanent failures.
-- **No file locking or versioning.** Atomic rename only; concurrent writers overwrite each other.
-- **Text files only** (UTF-8 strings over IPC), with no size limits.
-- **Listeners are registered by the platform only.** Agents can't create their own listeners over IPC yet.
-- **Listeners only watch files.** No timers or schedules, no agent-to-agent events, and deletes aren't reported. Change detection uses mtime + size, so a rewrite that keeps both the same is missed.
-- **Workflows are sequential only.** No branching, parallel steps, timers, or cancellation.
-- **Steps have no deadline.** A step assigned to an agent that never starts waits forever, because reassignment only happens after a `failed` item. A per-step timeout that triggers reassignment is the obvious next addition.
-- **Step outputs are whatever the agent returns.** There's no schema; a template that refers to a missing field is left unfilled.
-- **Scans cost O(files) each pass,** which is fine for a toy and expensive for big trees. `fs.watch` could later serve as a "scan now" hint on top of the snapshot model.
-- **Runtimes run via `tsx`** (`--import tsx`) to keep dev simple; no build step.
+See [ARCHITECTURE.md §10](ARCHITECTURE.md#10-known-limitations-and-next-steps) for the full list of known limitations and planned next steps.
