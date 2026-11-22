@@ -1,0 +1,553 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A practical, source-linked guide to mini-agent-runtime: first task, architecture, persistence, recovery, workflows, and API reference.">
+  <title>mini-agent-runtime — A field guide</title>
+  <style>
+    :root { color-scheme: light; --paper:#f6f5f0; --ink:#203331; --muted:#586c67; --line:#d5ded6; --green:#186b52; --lime:#d8f499; --card:#fffefa; --code:#152b29; }
+    * { box-sizing:border-box; }
+    html { scroll-behavior:smooth; scroll-padding-top:32px; }
+    body { margin:0; background:var(--paper); color:var(--ink); font:16px/1.75 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    a { color:var(--green); text-underline-offset:4px; }
+    a:hover { text-decoration-thickness:2px; }
+    button,a,input,summary { -webkit-tap-highlight-color:transparent; }
+    :focus-visible { outline:3px solid #b86822; outline-offset:4px; }
+    .skip { position:fixed; top:-80px; left:20px; background:white; padding:12px; z-index:10; }
+    .skip:focus { top:12px; }
+    .rail { position:fixed; inset:0 auto 0 0; width:260px; padding:32px 25px; border-right:1px solid var(--line); overflow:auto; background:#edf1e9; }
+    .brand { font-weight:800; letter-spacing:-.6px; font-size:19px; text-decoration:none; color:var(--ink); }
+    .eyebrow { color:var(--green); font:700 11px/1.5 ui-monospace,monospace; letter-spacing:1.8px; text-transform:uppercase; }
+    .rail .eyebrow { margin:8px 0 28px; }
+    nav a { display:block; padding:6px 10px; margin:3px 0; text-decoration:none; font-size:13px; border-radius:5px; color:var(--muted); }
+    nav a:hover,nav a[aria-current="location"] { background:#dce6d7; color:#174b3c; }
+    nav span { display:inline-block; width:24px; font:11px ui-monospace,monospace; opacity:.7; }
+    .rail-footer { margin-top:28px; padding-top:20px; border-top:1px solid var(--line); font-size:12px; color:var(--muted); }
+    main { max-width:1320px; margin-left:260px; padding:60px clamp(24px,5vw,80px) 50px; }
+    header { padding:10px 0 48px; border-bottom:1px solid var(--line); }
+    h1 { font-size:clamp(42px,5.5vw,76px); line-height:1.05; letter-spacing:-3px; max-width:900px; margin:24px 0; font-weight:750; }
+    h1 em { font-style:normal; color:var(--green); }
+    .lede { max-width:730px; font-size:21px; line-height:1.6; color:var(--muted); }
+    .tags { display:flex; gap:8px; flex-wrap:wrap; margin-top:25px; }
+    .tag { border:1px solid var(--line); border-radius:99px; padding:4px 12px; font-size:12px; }
+    section { padding:48px 0; border-bottom:1px solid var(--line); }
+    h2 { font-size:32px; line-height:1.2; letter-spacing:-1px; margin:10px 0 24px; }
+    h3 { font-size:20px; line-height:1.4; margin:30px 0 12px; }
+    p { margin:12px 0; }
+    .intro { font-size:18px; max-width:790px; }
+    .grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:16px; margin:24px 0; }
+    .two { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    .card { padding:22px; background:var(--card); border:1px solid var(--line); border-radius:10px; }
+    .card h3 { margin:0 0 10px; }
+    .card p { font-size:14px; }
+    .callout { padding:18px 24px; border-left:4px solid var(--green); background:#e7efe1; margin:24px 0; border-radius:0 8px 8px 0; }
+    .caution { background:#f4ebd9; border-color:#a96c26; }
+    code { font: .88em/1.6 ui-monospace,SFMono-Regular,Consolas,monospace; overflow-wrap:anywhere; }
+    :not(pre)>code { background:#e7ece5; border-radius:3px; padding:2px 5px; }
+    pre { background:var(--code); color:#e3f1e7; border-radius:8px; padding:24px; overflow:auto; line-height:1.7; tab-size:2; }
+    pre code { font-size:13px; overflow-wrap:normal; }
+    .code-label { margin:24px 0 -10px; font:12px ui-monospace,monospace; color:var(--muted); }
+    .table-wrap { overflow:auto; margin:20px 0; border:1px solid var(--line); border-radius:8px; }
+    table { width:100%; border-collapse:collapse; font-size:14px; text-align:left; background:var(--card); }
+    th { background:#e9eee5; font-size:12px; letter-spacing:.5px; }
+    td,th { padding:13px 16px; vertical-align:top; border-bottom:1px solid var(--line); }
+    tr:last-child td { border-bottom:0; }
+    td:first-child { min-width:150px; }
+    ul,ol { padding-left:23px; }
+    li { margin:8px 0; }
+    .source { font-size:12px; color:var(--muted); margin-top:22px; }
+    .architecture { background:var(--code); color:#edf5e9; padding:28px; border-radius:12px; margin:26px 0; }
+    .architecture .eyebrow { color:var(--lime); }
+    .layer { border:1px solid #5b7970; border-radius:7px; padding:18px; margin-top:12px; }
+    .layer strong { display:block; }
+    .layer small { color:#c0d3c8; }
+    .connector { text-align:center; color:var(--lime); font:12px/1.7 ui-monospace,monospace; padding:12px 0 0; }
+    .kernel-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:14px; }
+    .kernel-grid span { border:1px solid #466359; padding:8px; font-size:12px; text-align:center; border-radius:4px; }
+    .trace { border:1px solid var(--line); border-radius:12px; padding:24px; background:var(--card); }
+    .controls { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:20px; }
+    button { font:inherit; font-size:13px; cursor:pointer; border:1px solid var(--line); background:var(--paper); color:var(--ink); padding:9px 15px; border-radius:6px; }
+    button[aria-pressed="true"] { background:var(--green); color:white; border-color:var(--green); }
+    .trace ol { margin-bottom:0; }
+    .trace li::marker { color:var(--green); font-weight:700; }
+    .trace-status { font:12px ui-monospace,monospace; color:var(--green); }
+    details { margin:12px 0; padding:16px 20px; border:1px solid var(--line); border-radius:8px; background:var(--card); }
+    summary { cursor:pointer; font-weight:650; }
+    footer { padding:30px 0; font-size:13px; color:var(--muted); }
+    .progress { position:fixed; top:0; left:260px; right:0; height:3px; z-index:5; background:transparent; }
+    .progress div { height:100%; width:0; background:var(--green); }
+    @media(max-width:1050px) { .rail { width:220px; padding:24px 16px; } main { margin-left:220px; padding:40px 28px; } .progress { left:220px; } .grid { grid-template-columns:1fr; } .two { grid-template-columns:1fr 1fr; } }
+    @media(max-width:760px) { .rail { position:static; width:auto; padding:22px; border-right:0; border-bottom:1px solid var(--line); } .rail .eyebrow { margin:5px 0 15px; } nav { display:grid; grid-template-columns:1fr 1fr; } nav a { font-size:12px; padding:5px; } .rail-footer { display:none; } main { margin:0; padding:32px 20px; } h1 { letter-spacing:-2px; } .two { grid-template-columns:1fr; } .progress { left:0; } .kernel-grid { grid-template-columns:1fr 1fr; } pre { padding:18px; } }
+    @media(prefers-reduced-motion:reduce) { html { scroll-behavior:auto; } }
+    @media print { .rail,.progress,.controls,.skip { display:none; } main { margin:0; padding:0; max-width:none; } body { font-size:11pt; background:white; } section { padding:20px 0; } h1 { font-size:36pt; } h2,h3 { break-after:avoid; } pre { white-space:pre-wrap; overflow-wrap:anywhere; background:#eee; color:#111; } .card,.callout,.trace,details { break-inside:avoid; } a { color:inherit; } }
+  </style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<div class="progress" aria-hidden="true"><div id="progress-bar"></div></div>
+<aside class="rail">
+  <a class="brand" href="#main">mini-agent-runtime<span aria-hidden="true"> ↗</span></a>
+  <p class="eyebrow">A codebase field guide</p>
+  <nav aria-label="Guide chapters">
+    <a href="#principles"><span>01</span> The mental model</a>
+    <a href="#first-task"><span>02</span> Your first task</a>
+    <a href="#architecture"><span>03</span> Inside the platform</a>
+    <a href="#journey"><span>04</span> Follow a task</a>
+    <a href="#recovery"><span>05</span> Failure &amp; recovery</a>
+    <a href="#agents"><span>06</span> Agent API &amp; types</a>
+    <a href="#files"><span>07</span> Files &amp; permissions</a>
+    <a href="#workflows"><span>08</span> Durable workflows</a>
+    <a href="#listeners"><span>09</span> Files become work</a>
+    <a href="#operations"><span>10</span> Lifecycle &amp; tuning</a>
+    <a href="#observability"><span>11</span> Inspect &amp; diagnose</a>
+    <a href="#reference"><span>12</span> API desk reference</a>
+    <a href="#code-map"><span>13</span> Explore the source</a>
+    <a href="#boundaries"><span>14</span> Boundaries &amp; next steps</a>
+  </nav>
+  <div class="rail-footer">TypeScript · SQLite · Node IPC<br>Source-based review · November 2026<br><br>Read in order to learn.<br>Use the chapters to look things up.<br>Works offline. Print-friendly.</div>
+</aside>
+<main id="main">
+  <header>
+    <p class="eyebrow">Onboarding / architecture / API</p>
+    <h1>Processes come and go.<br><em>The work stays.</em></h1>
+    <p class="lede">A guided tour of a small local agent platform: how a typed function becomes durable work, how a crash becomes a retry, and how independent workers become a workflow.</p>
+    <div class="tags"><span class="tag">Node ≥ 24</span><span class="tag">ES modules + tsx</span><span class="tag">At-least-once delivery</span><span class="tag">One local platform</span></div>
+    <p class="source">Based on the implementation in this checkout. Source links open repository files relative to this document. Roadmap ideas are identified separately from existing behavior.</p>
+  </header>
+
+  <section id="principles">
+    <p class="eyebrow">01 / Start with the problem</p><h2>A function call forgets. A task remembers.</h2>
+    <p class="intro">An ordinary function runs inside your process. If the process dies, its local state and unfinished work disappear. This library records the work first, then gives it to a replaceable process. SQLite remembers what is still owed.</p>
+    <p>An “agent” here is a named worker offering typed tasks. It can call a language model, but the runtime does not require one, manage a conversation, or supply an autonomous reasoning loop. A task can simply transform text or write a file.</p>
+    <div class="grid">
+      <article class="card"><h3>Identity is durable</h3><p><strong>Agent</strong> = stable name, UUID, stored config, inbox, and private files. Registering the same name on the next boot finds the same identity.</p></article>
+      <article class="card"><h3>Execution is disposable</h3><p><strong>Runtime</strong> = one child process, with a PID and incarnation number. A replacement gets a new incarnation while keeping the agent’s identity.</p></article>
+      <article class="card"><h3>Work is recorded</h3><p><strong>Task</strong> = a durable inbox item. Its ID stays the same across retries. Its status and result outlive the process that executed it.</p></article>
+    </div>
+    <div class="table-wrap"><table><thead><tr><th>Keep these separate</th><th>What each means</th></tr></thead><tbody>
+      <tr><td>Definition → agent</td><td>A definition is code and schemas. An agent is a persistent identity using that code. Several agents can use one definition.</td></tr>
+      <tr><td>TaskRef → TaskHandle</td><td>A ref names an operation, such as <code>writer.task("save")</code>. A handle identifies one execution returned by <code>send()</code>.</td></tr>
+      <tr><td>Inbox → dispatcher</td><td>The inbox stores pending obligations. The dispatcher delivers them when a runtime is running and available.</td></tr>
+      <tr><td>WorkflowRef → WorkflowHandle</td><td>A ref is a registered recipe. A handle is one persisted run of that recipe.</td></tr>
+    </tbody></table></div>
+    <div class="callout"><strong>The central design rule:</strong> code defines behavior; the database stores progress. Register agent modules, workflow definitions, listener targets, and restart policies on every boot.</div>
+  </section>
+
+  <section id="first-task">
+    <p class="eyebrow">02 / Get something running</p><h2>From zero to a durable note</h2>
+    <p>In the repository root, install dependencies and try the complete library showcase. The package exports TypeScript source directly; there is no build step. Use Node 24 or newer and <code>tsx</code>.</p>
+    <pre><code>npm install
+npm run demo:newsroom
+
+# Development checks
+npm run typecheck
+npm test</code></pre>
+    <p>The newsroom demo intentionally recreates <code>examples/newsroom/data</code> each run. It demonstrates offline workers, a crashed editor, file sharing, and fallback review. For a minimal example you can keep, create these two files at the repository root.</p>
+    <p class="code-label">notes.agent.ts — the worker’s definition</p>
+    <pre data-example="agent"><code>import { z } from "zod";
+import { defineAgent } from "mini-agent-runtime";
+
+export default defineAgent(import.meta.url, {
+  tasks: {
+    save: {
+      input: z.object({
+        name: z.string().regex(/^[a-z0-9-]+$/),
+        text: z.string(),
+      }),
+      async run({ name, text }, ctx) {
+        ctx.log(`Saving on attempt ${ctx.attempt}`);
+        return ctx.fs.write(`~/notes/${name}.txt`, text);
+      },
+    },
+    read: {
+      input: z.object({ path: z.string() }),
+      run: ({ path }, ctx) =&gt; ctx.fs.read(path),
+    },
+  },
+});</code></pre>
+    <p class="code-label">review-demo.ts — the platform application</p>
+    <pre data-example="main"><code>import { createPlatform } from "mini-agent-runtime";
+import notes from "./notes.agent.js";
+
+await using platform = createPlatform({ dataDir: "review-data" });
+const writer = platform.agent("writer", notes);
+
+await platform.start();
+
+const save = writer.task("save");
+const task = save.send(
+  { name: "hello", text: "A process can go away. This note stays." },
+  { idempotencyKey: "first-note-v1" },
+);
+
+const saved = await task.result();
+console.log(saved); // { path: "agents/&lt;uuid&gt;/notes/hello.txt", bytes: ... }
+console.log(await writer.send("read", { path: saved.path }).result());
+console.log(task.info().status); // "completed"
+// await using closes the platform at the end of this module.</code></pre>
+    <pre><code>npx tsx review-demo.ts</code></pre>
+    <p>The <code>.js</code> import follows this repository’s NodeNext convention; <code>tsx</code> resolves the TypeScript source. On the second run, the same name finds the same agent and the same idempotency key returns the original save task. Change the key or omit it to request new work.</p>
+    <ol><li><code>defineAgent</code> packages task schemas, handlers, and the module URL.</li><li><code>platform.agent</code> binds that definition to a durable name.</li><li><code>start</code> recovers old work before starting runtimes.</li><li><code>send</code> validates and stores input synchronously, returning a handle.</li><li><code>result</code> waits for durable completion or rejects on final failure.</li></ol>
+    <p class="source">Source: <a href="src/lib/agent.ts">agent definitions</a> · <a href="src/lib/platform.ts">platform and task handles</a> · <a href="examples/newsroom/main.ts">newsroom example</a></p>
+  </section>
+
+  <section id="architecture">
+    <p class="eyebrow">03 / Three layers, one authority</p><h2>The platform owns state. Hosts execute code.</h2>
+    <div class="architecture" role="img" aria-label="The public API and kernel live in the platform process. The kernel persists state in SQLite and files, and communicates over validated IPC with separate runtime hosts that load agent definitions.">
+      <div class="eyebrow">Platform process</div>
+      <div class="layer"><strong>Public library · src/lib/</strong><small>Definitions · typed refs and handles · builders · named events</small></div>
+      <div class="layer"><strong>Kernel · src/platform/</strong><div class="kernel-grid"><span>Registry → identity</span><span>Inbox → durable work</span><span>Dispatcher → delivery</span><span>Supervisor → processes</span><span>Filesystem → grants</span><span>Listeners → file events</span><span>Workflows → progress</span><span>SQLite → saved state</span><span>Data root → files</span></div></div>
+      <div class="connector">↓ fork() + INIT / TASK / FS_RESPONSE<br>↑ READY / TASK_COMPLETED / ERROR / FS_REQUEST</div>
+      <div class="layer"><strong>Runtime process · src/runtime/host.ts</strong><small>Imports an agent module → validates input → calls run(input, ctx)<br>One host per running agent; replaced after a crash.</small></div>
+    </div>
+    <p>The public API wires services together and preserves TypeScript inference. The kernel owns persistence and scheduling. The generic runtime host knows how to load and execute an agent, but never reads the inbox directly.</p>
+    <h3>What lives where?</h3>
+    <div class="table-wrap"><table><thead><tr><th>Location</th><th>Contents</th><th>Survives platform restart?</th></tr></thead><tbody>
+      <tr><td>SQLite</td><td><code>agents</code>, <code>runtimes</code>, <code>inbox</code>, <code>fs_grants</code>, <code>fs_audit</code>, <code>listeners</code>, <code>listener_files</code>, <code>workflows</code>, <code>workflow_steps</code>, <code>workflow_events</code></td><td>Yes, with a persistent database.</td></tr>
+      <tr><td>Data directory</td><td><code>agents/&lt;id&gt;/</code>, <code>shared/documents/</code>, <code>shared/artifacts/</code></td><td>Yes.</td></tr>
+      <tr><td>Platform memory</td><td>Module registrations, policies, workflow functions, listener target functions, live child processes, event subscribers, waiting promises</td><td>No. Re-register code and reattach by ID.</td></tr>
+      <tr><td>Runtime memory</td><td>Imported module state, parsed config, current handler work, pending filesystem requests</td><td>No. A task retry starts its handler again.</td></tr>
+    </tbody></table></div>
+    <p><code>better-sqlite3</code> provides synchronous local transactions; the database enables WAL and foreign keys. Ordered migrations use <code>PRAGMA user_version</code>, with foreign-key checks during migration. A schema newer than the code is rejected.</p>
+    <p>Both IPC directions validate message envelopes with Zod. <code>INIT</code> assigns identity, incarnation, configuration, and module URL. The host imports the module, validates config, then returns <code>READY</code>; the supervisor checks the identity echo. Failed imports or bad default exports reject startup.</p>
+    <p class="source">Source: <a href="src/platform/database.ts">schema and migrations</a> · <a href="src/shared/protocol.ts">IPC protocol</a> · <a href="src/runtime/host.ts">runtime host</a></p>
+  </section>
+
+  <section id="journey">
+    <p class="eyebrow">04 / Trace one request</p><h2>A task’s journey, including the unhappy paths</h2>
+    <p>The dispatcher normally allows one outstanding delivery per agent, selecting the oldest pending item. Different agents can work concurrently. Choose a path below to follow the same durable task through the system.</p>
+    <div class="trace">
+      <div class="controls" aria-label="Task journey scenarios">
+        <button type="button" data-scenario="success" aria-pressed="true">Successful task</button>
+        <button type="button" data-scenario="crash" aria-pressed="false">Runtime crashes</button>
+        <button type="button" data-scenario="denied" aria-pressed="false">Permission denied</button>
+      </div>
+      <div id="trace-content" aria-live="polite" aria-atomic="true">
+        <div class="trace-status">pending → claimed → completed</div>
+        <ol><li><strong>Validate:</strong> TaskRef checks the input schema in the caller.</li><li><strong>Persist:</strong> Inbox stores the raw input and returns a stable task ID.</li><li><strong>Claim:</strong> Dispatcher records the runtime incarnation and increments attempts.</li><li><strong>Execute:</strong> Host validates input again, then invokes the handler.</li><li><strong>Commit:</strong> TASK_COMPLETED becomes the stored result, if the incarnation still owns the claim.</li><li><strong>Notify:</strong> Settlement wakes result() waiters and workflow reconciliation.</li></ol>
+      </div>
+    </div>
+    <noscript><p>Crash path: a claim is released, then redelivered with the same task ID and a higher attempt count, or failed if its budget is exhausted. Permission-denied path: the task fails permanently on that attempt.</p></noscript>
+    <h3>Why “at least once” matters</h3>
+    <p>Imagine a handler sends an email, then crashes before its completion is recorded. The inbox still owes the task, so the replacement runs it again. Durable delivery cannot by itself make that email happen exactly once.</p>
+    <div class="callout"><strong>Two separate deduplication tools:</strong> a caller’s <code>idempotencyKey</code> prevents duplicate inbox items for the same recipient. A handler’s stable <code>ctx.taskId</code> can be passed to an external service to deduplicate effects across deliveries. A new workflow fallback assignment creates a new task ID; effects shared across candidates may need a workflow-level key.</div>
+    <p>Inbox deduplication is scoped to the recipient agent, not the task name. Reusing a key for another operation on that agent returns the original item; it does not update the payload. Workflow start keys are scoped to the workflow name.</p>
+    <p class="source">Source: <a href="src/platform/inbox.ts">claims, settlement, deduplication</a> · <a href="src/platform/dispatcher.ts">delivery loop</a></p>
+  </section>
+
+  <section id="recovery">
+    <p class="eyebrow">05 / Design for interruption</p><h2>Retries and restarts solve different problems</h2>
+    <div class="grid two"><article class="card"><h3>Retry a task</h3><p>The inbox counts deliveries. A normal handler error returns the item to pending until <code>maxAttempts</code> is reached (default: 3). The same runtime can execute the next attempt. Handler-error retries have no exponential backoff.</p></article><article class="card"><h3>Restart a runtime</h3><p>The supervisor replaces a crashed process according to its agent policy. Restarts use exponential backoff and a sliding-window cap. A deliberate stop does not trigger automatic restart.</p></article></div>
+    <div class="table-wrap"><table><thead><tr><th>Failure</th><th>What happens</th></tr></thead><tbody>
+      <tr><td>Invalid send input</td><td><code>TaskInputError</code> is thrown before anything is enqueued.</td></tr>
+      <tr><td>Handler throws a normal error</td><td>Retry while delivery budget remains; otherwise settle failed.</td></tr>
+      <tr><td><code>PermanentError</code> or <code>FsDeniedError</code></td><td>Fail this task immediately. A containing workflow may still try its next candidate.</td></tr>
+      <tr><td>Unknown task / invalid host input</td><td>The runtime rejects it as non-retryable.</td></tr>
+      <tr><td>Runtime exits mid-task</td><td>Release its claims to pending, or fail exhausted items. Crashes count toward task attempts too.</td></tr>
+      <tr><td>Restart cap reached</td><td>Runtime becomes <code>given-up</code>. Manual <code>agent.start()</code> clears supervision history and tries again. Pending work may remain waiting.</td></tr>
+      <tr><td>Platform restarts</td><td>Close stale runtime rows, release old claims, reconcile workflows, start scanning, then start autostart agents.</td></tr>
+    </tbody></table></div>
+    <p><strong>Incarnation fencing</strong> prevents a reply from an old process from completing a claim owned by its replacement. Inbox completion and failure updates require the matching claiming incarnation.</p>
+    <div class="callout caution"><strong>Timeouts do not cancel handlers.</strong> The request timeout defaults to 5 seconds. The supervisor rejects the wait but leaves the process running, so a retry can overlap a still-executing handler. Correlation uses task ID, not a unique delivery ID; incarnation fencing does not distinguish timed-out attempts in the same process. Set a suitable request timeout and make effects idempotent, especially for model or network calls.</div>
+    <p>Recovery resumes durable tasks and workflow steps; it does not restore a JavaScript stack or continue a handler at its interrupted line. Waiting promises are also local to the current process: retain IDs and create new handles after a restart.</p>
+    <p class="source">Source: <a href="src/platform/supervisor.ts">supervision and request timeout</a> · <a href="tests/supervision.test.ts">supervision tests</a> · <a href="tests/inbox.test.ts">inbox recovery tests</a></p>
+  </section>
+
+  <section id="agents">
+    <p class="eyebrow">06 / Authoring agents</p><h2>Types at the call site, validation at the boundary</h2>
+    <p>Export <code>defineAgent(import.meta.url, { config?, tasks })</code> as the module’s default export. Each task has an <code>input</code> Zod schema and a <code>run(input, ctx)</code> handler. The return value determines the output type; there is no declared output schema or runtime output validation.</p>
+    <div class="callout"><strong>One module, two processes.</strong> The application imports the definition to register it; each host imports it to execute tasks. Keep top-level code free of startup side effects. Put platform bootstrapping in a separate module.</div>
+    <h3>The handler’s context</h3>
+    <div class="table-wrap"><table><thead><tr><th>Field</th><th>Use it for</th></tr></thead><tbody>
+      <tr><td><code>ctx.agent</code></td><td><code>{ id, name, incarnation }</code>: identity plus current process generation.</td></tr>
+      <tr><td><code>ctx.taskId</code></td><td>The stable inbox ID across deliveries. Useful for external idempotency.</td></tr>
+      <tr><td><code>ctx.attempt</code></td><td>Delivery number, starting at 1.</td></tr>
+      <tr><td><code>ctx.config</code></td><td>Schema-parsed configuration, or <code>undefined</code> with no config schema.</td></tr>
+      <tr><td><code>ctx.log(text)</code></td><td>Runtime console output prefixed with identity and PID; enable <code>runtime.inheritStdio</code> to see it in the parent.</td></tr>
+      <tr><td><code>ctx.fs</code></td><td>Async <code>read</code>, <code>write</code>, <code>list</code>, <code>share</code>, and <code>revoke</code> through the platform.</td></tr>
+    </tbody></table></div>
+    <h3>Raw input versus parsed input</h3>
+    <p><code>TaskInput&lt;D, K&gt;</code> is the schema’s <em>input</em> type; the handler sees its <em>output</em> type after defaults and transforms. <code>send()</code> validates but stores the raw value, allowing the runtime to parse the original input rather than transform an already-transformed value. Keep schemas deterministic and free of effects: parsing happens more than once.</p>
+    <pre><code>// A task schema can accept a string and give its handler a number.
+input: z.object({ count: z.string().transform(Number) })
+// caller: { count: "3" }      handler: { count: 3 }
+
+// Type helpers exported by the package:
+type SaveInput = TaskInput&lt;typeof notes, "save"&gt;;
+type SaveOutput = TaskOutput&lt;typeof notes, "save"&gt;;
+type Names = TaskNames&lt;typeof notes&gt;;</code></pre>
+    <h3>Config belongs to identity; parsed config belongs to a runtime</h3>
+    <p>Declare a config schema in the definition and supply <code>{ config: ... }</code> in <code>platform.agent()</code>. Registration validates before changing stored state. Omitting config preserves the stored value; without prior config, validation sees <code>{}</code>. Raw config is persisted, then parsed at host startup. A changed value takes effect on the next start or restart. A path in config does not grant permission to that path.</p>
+    <p>Keep task inputs, results, config, and workflow outputs JSON-compatible. They cross Node IPC and JSON storage: classes, functions, dates, and big integers do not retain arbitrary JavaScript semantics. A handler returning <code>undefined</code> is stored as <code>null</code>, even though the inferred return type can be <code>void</code>.</p>
+    <p class="source">Source: <a href="src/lib/agent.ts">context and inference</a> · <a href="src/lib/platform.ts">raw input storage</a> · <a href="tests/library-refs.test.ts">transform and config tests</a></p>
+  </section>
+
+  <section id="files">
+    <p class="eyebrow">07 / Shared data without shared ownership</p><h2>Every platform file operation has an identity</h2>
+    <pre><code>review-data/
+├── platform.db
+├── agents/&lt;agent-id&gt;/     ← ~/ inside that agent
+└── shared/
+    ├── documents/
+    └── artifacts/</code></pre>
+    <p>Paths are logical, POSIX-style paths relative to the data root. An agent implicitly owns <code>agents/&lt;its-id&gt;/**</code>. Shared paths are closed until the platform grants access.</p>
+    <pre><code>// Platform code: authority to grant shared access.
+writer.grant("shared/documents/in", "read");
+writer.grant("shared/artifacts/out", "write");
+
+// Handler code: authority to share its own files.
+const saved = await ctx.fs.write("~/report.txt", "Approved");
+await ctx.fs.share(saved.path, reviewerId, "read");
+// Later: await ctx.fs.revoke(saved.path, reviewerId);</code></pre>
+    <ul><li>A directory grant covers its subtree. The most specific matching grant wins; write access also allows reads.</li><li>An agent may share or revoke paths it owns, not re-grant arbitrary shared paths just because it can read them.</li><li>The platform derives the caller’s identity from the IPC channel, not from a field the runtime supplies.</li><li>Paths are normalized before authorization; root escapes and symlink traversal are rejected. Decisions are audited.</li><li>Writes use a temporary file followed by rename so readers see the old or new contents. Scans and listings skip <code>*.tmp</code> files.</li></ul>
+    <div class="callout caution"><strong>This is a cooperative permission system.</strong> Child processes run as the same OS user and can import <code>node:fs</code> directly. These grants protect operations through <code>ctx.fs</code>; they are not an OS sandbox for hostile code. File writes and SQLite updates are also separate persistence boundaries.</div>
+    <p class="source">Source: <a href="src/platform/filesystem.ts">authorization and atomic writes</a> · <a href="tests/filesystem.test.ts">permission tests</a></p>
+  </section>
+
+  <section id="workflows">
+    <p class="eyebrow">08 / Compose durable work</p><h2>A workflow is a persisted sequence of task assignments</h2>
+    <p>Each step sends an ordinary inbox task. When that item settles, workflow reconciliation advances the run. A platform restart can catch up by reading the same stored statuses; the workflow does not depend on an uninterrupted chain of promises.</p>
+    <p>Using <code>writer</code> and the definition from the first example, register this workflow before <code>platform.start()</code>. Start the run after startup.</p>
+    <pre data-example="workflow"><code>const noteAndRead = platform.workflow("note-and-read")
+  .input(z.object({ name: z.string(), text: z.string() }))
+  .step("save", writer.task("save"), ({ input }) =&gt; input)
+  .step("read", writer.task("read"), ({ steps }) =&gt; ({
+    path: steps.save.path,
+  }))
+  .output(({ steps }) =&gt; ({
+    path: steps.save.path,
+    text: steps.read,
+  }))
+  .build();
+
+// After await platform.start():
+const run = noteAndRead.start({ name: "memo", text: "Hello" });
+const output = await run.result(); // { path: string, text: string }
+const saved = run.step("save");
+if (saved.status === "completed") console.log(saved.result.path);
+console.log(run.task("read")?.info().attempts);
+const reattached = noteAndRead.run(run.id);</code></pre>
+    <p>Add <code>import { z } from "zod"</code> to the application for this example. Step names must be unique, and a workflow needs at least one step. Each input function sees parsed workflow input, earlier step outputs, and <code>workflow.id</code>. Without <code>.output()</code>, the result is the last step’s output.</p>
+    <h3>Fallback is sequential, not a race</h3>
+    <pre><code>// With separately registered junior and senior agents:
+.step("review", [junior.task("review"), senior.task("review")],
+  ({ steps }) =&gt; ({ path: steps.save.path }))</code></pre>
+    <p>The first candidate gets the step. Only when its task finally fails does the next candidate get a new task. An offline candidate’s task waits in its inbox; unavailability alone does not trigger fallback. The assignment counter starts at 1. <code>run.task(name)</code> points to the current candidate’s task.</p>
+    <p>Candidates may be different task names, but their TypeScript input types must agree. The computed input is validated against <em>every</em> candidate schema, and the output type is their union. Input mapping runs again on reassignment, so keep it pure and deterministic. A mapping error fails the workflow; it is not a handler retry.</p>
+    <h3>Recovery and definition changes</h3>
+    <p>The run stores its definition name and a fingerprint of step order, names, task names, candidate agent names, and the presence of an output projection. Missing code leaves a running workflow skipped until registered. A changed fingerprint fails a running workflow with “definition changed.”</p>
+    <p>The fingerprint does <strong>not</strong> hash handler code, schemas, mapping functions, or the projection’s body. Reusing a name after changing that logic can affect unfinished runs. This is shape checking, not complete code versioning.</p>
+    <p><code>ref.run(id)</code> verifies the name and fingerprint before returning a typed handle. <code>platform.workflowRun(id)</code> gives untyped inspection. <code>run.input()</code> returns the original raw input; step functions see parsed input. Output projections run in the platform process, should be synchronous and pure, and fail the run if they throw; their result is persisted.</p>
+    <p class="source">Source: <a href="src/lib/workflows.ts">typed builder and handles</a> · <a href="src/platform/workflows.ts">reconciliation and fingerprint</a> · <a href="tests/library-workflows.test.ts">workflow tests</a></p>
+  </section>
+
+  <section id="listeners">
+    <p class="eyebrow">09 / Turn files into work</p><h2>A listener remembers what it has seen</h2>
+    <p>Listeners recursively scan a logical directory and compare file modification time and size with a persisted snapshot. They can notice files that arrived while the agent—or the platform—was offline, provided those files remain visible when scanning resumes.</p>
+    <pre><code>// Register before platform.start(), using the writer from the first example.
+writer.grant("shared/documents/in", "read");
+const incoming = platform.listen("incoming-notes", {
+  dir: "shared/documents/in",
+  events: ["created", "modified"],
+  includeExisting: true,
+}).send(writer.task("read"), file =&gt; ({ path: file.path }));
+
+const nextTwo = incoming.take(2); // subscribe before files arrive
+// After startup and two matching file events:
+const tasks = await nextTwo;
+const texts = await Promise.all(tasks.map(task =&gt; task.result()));</code></pre>
+    <div class="grid two"><article class="card"><h3>Send a task</h3><p><code>.send(taskRef, mapper)</code> requires the target agent to have read access to the watched directory. Access is checked at registration and on every scan.</p></article><article class="card"><h3>Start a workflow</h3><p><code>.startWorkflow(ref, mapper)</code> is platform-owned and does not require an agent grant to scan. Tasks in that workflow still need their own file permissions.</p></article></div>
+    <ul><li>Default events: <code>["created"]</code>. Existing files are baselined on first registration unless <code>includeExisting: true</code>.</li><li>The same name preserves its snapshot on later boots. Changing its directory resets the snapshot. Register its target function again every boot.</li><li>Defaults: a 1,000 ms scan interval and a 100 ms mtime settling delay. There is no deletion event; disappeared files are forgotten.</li><li>Successful target creation and snapshot advancement share a database transaction. An idempotency key based on listener name, event, path, and mtime guards repeated delivery of the observed version.</li><li>A mapping or target error emits <code>listener.error</code> and still marks that version seen. It is not automatically retried every scan; a subsequent change can fire again.</li><li><code>onFire()</code> and <code>take(n)</code> observe future firings in this process. They do not replay history. <code>take(n)</code> waits for handles, not task completion, and has no timeout.</li></ul>
+    <p>This is snapshot polling, not a complete filesystem event journal. A create-and-delete between scans can be missed; metadata-based detection is not content hashing. Keep durable input files available until processed.</p>
+    <p class="source">Source: <a href="src/platform/listeners.ts">scan and transaction behavior</a> · <a href="tests/listeners.test.ts">listener edge cases</a></p>
+  </section>
+
+  <section id="operations">
+    <p class="eyebrow">10 / Operate the platform</p><h2>Register first. Recover second. Execute third.</h2>
+    <ol><li><strong>Create:</strong> <code>createPlatform()</code> opens/migrates the database, creates filesystem roots, and wires services. It does not start runtimes or scanning.</li><li><strong>Register:</strong> agents, grants, workflows, listeners, and event subscribers. Duplicate names of the same kind in one platform instance are rejected.</li><li><strong>Start:</strong> recover runtime records → release stale claims → reconcile workflows → start listeners → start autostart agents concurrently.</li><li><strong>Work:</strong> send tasks, start workflows, inspect handles. Sending to an offline agent is valid; work waits.</li><li><strong>Close:</strong> stop scanning, stop runtimes, let final settlement notifications run, close SQLite. <code>close()</code> is safe twice; <code>await using</code> invokes it automatically.</li></ol>
+    <p><code>start()</code> is a one-time lifecycle transition. If any autostart fails, it rejects after collecting failures, while successfully started agents remain running. Close in cleanup or fix and manually start the failed agent; do not call <code>platform.start()</code> again. Shutdown is not a drain-all-tasks operation: unfinished work remains recoverable.</p>
+    <p>Agent manual start/restart requires platform startup first. Agents registered after startup autostart asynchronously by default; failure emits <code>agent.start-failed</code>. Workflows registered after startup trigger catch-up for running workflows.</p>
+    <div class="table-wrap"><table><thead><tr><th>Option</th><th>Default</th><th>Effect</th></tr></thead><tbody>
+      <tr><td><code>dataDir</code></td><td>Required</td><td>Filesystem root and default database location.</td></tr>
+      <tr><td><code>dbPath</code></td><td><code>&lt;dataDir&gt;/platform.db</code></td><td>Override DB path; <code>:memory:</code> is useful in tests, but files still live on disk.</td></tr>
+      <tr><td><code>inbox.maxAttempts</code></td><td>3</td><td>Delivery budget per inbox item.</td></tr>
+      <tr><td><code>listeners.intervalMs / settleMs</code></td><td>1,000 / 100</td><td>Polling frequency and minimum mtime age.</td></tr>
+      <tr><td><code>runtime.requestTimeoutMs</code></td><td>5,000</td><td>IPC request wait, including task execution and startup handshake.</td></tr>
+      <tr><td><code>runtime.stopTimeoutMs</code></td><td>2,000</td><td>Time before forced kill during a stop.</td></tr>
+      <tr><td><code>runtime.inheritStdio</code></td><td>false</td><td>Forward runtime stdout/stderr.</td></tr>
+      <tr><td>Agent <code>autostart / restart</code></td><td>true / <code>"on-crash"</code></td><td>Automatic initial start and crash replacement policy.</td></tr>
+      <tr><td>Restart policy limits</td><td>5 restarts / 60,000 ms</td><td><code>maxRestarts</code> and <code>windowMs</code> cap crash loops.</td></tr>
+      <tr><td>Restart delays</td><td>100 → max 10,000 ms</td><td><code>backoffMs</code> doubles; <code>maxBackoffMs</code> caps the delay.</td></tr>
+    </tbody></table></div>
+    <p class="source">Source: <a href="src/lib/platform.ts">lifecycle and options</a> · <a href="src/platform/supervisor.ts">restart policy</a></p>
+  </section>
+
+  <section id="observability">
+    <p class="eyebrow">11 / Explain what happened</p><h2>Use handles for state, events for a live timeline</h2>
+    <pre><code>const unsubscribe = platform.events.onAny((name, event) =&gt; {
+  console.log(name, event);
+});
+
+platform.events.on("task.settled", event =&gt; {
+  console.log(event.agent.name, event.taskId, event.status);
+});
+
+// Durable inspection:
+writer.inbox("failed");
+writer.history();
+platform.task(taskId).info();
+platform.workflowRun(runId).events();
+
+// Later:
+unsubscribe();</code></pre>
+    <p><code>on</code>, <code>once</code>, and <code>onAny</code> return unsubscribe functions. Public events carry <code>AgentRef</code> objects with both <code>id</code> and <code>name</code>. Subscriptions are synchronous, in-memory notifications: keep callbacks quick and avoid throwing. The public event stream is not a persisted, replayable log; workflow transition history is stored separately.</p>
+    <div class="table-wrap"><table><thead><tr><th>Event family</th><th>Names</th></tr></thead><tbody>
+      <tr><td>Agent</td><td><code>agent.ready</code>, <code>agent.exited</code>, <code>agent.restarting</code>, <code>agent.gave-up</code>, <code>agent.start-failed</code></td></tr>
+      <tr><td>Task</td><td><code>task.enqueued</code>, <code>task.delivered</code>, <code>task.attempt-failed</code>, <code>task.settled</code></td></tr>
+      <tr><td>Workflow</td><td><code>workflow.transition</code>, <code>workflow.settled</code>, <code>workflow.skipped</code></td></tr>
+      <tr><td>Listener / files</td><td><code>listener.fired</code>, <code>listener.error</code>, <code>listener.skipped</code>, <code>fs.denied</code></td></tr>
+    </tbody></table></div>
+    <h3>When something seems stuck</h3>
+    <details><summary>My task’s result() never resolves.</summary><p>Inspect <code>task.info()</code> and the agent’s <code>runtime()</code>. A pending task may belong to an offline, deliberately stopped, or given-up agent. Start that agent. A waiting promise has no built-in deadline or cancellation. If the platform was restarted, reattach by task ID in the new platform instance.</p></details>
+    <details><summary>The listener sees no work—or take(2) waits forever.</summary><p>Check <code>listener.info()</code>, whether scanning has started, the logical directory, read grants for a task target, and whether pre-existing files were baselined. Subscribe before files arrive. Inspect <code>listener.skipped</code> and <code>listener.error</code>; a bad mapping consumes that observed file version.</p></details>
+    <details><summary>A workflow does not reach its fallback.</summary><p>Inspect <code>run.step(name)</code> and <code>run.task(name)?.info()</code>. Fallback waits for terminal task failure, not merely an offline runtime or an individual failed attempt. A stopped agent can hold pending work indefinitely.</p></details>
+    <details><summary>A change to code or config did not behave as expected.</summary><p>Config is parsed at runtime startup, and a module is loaded into its process. Restart for new runtime config/code. Register all definitions on the next platform boot. Workflow fingerprints detect structural changes but not changes to function bodies or schemas.</p></details>
+    <p class="source">Source: <a href="src/lib/events.ts">complete public event payloads</a> · <a href="src/lib/platform.ts">kernel-to-public event bridge</a></p>
+  </section>
+
+  <section id="reference">
+    <p class="eyebrow">12 / Keep this nearby</p><h2>The public API at a glance</h2>
+    <div class="table-wrap"><table><thead><tr><th>Object</th><th>Operations</th><th>Remember</th></tr></thead><tbody>
+      <tr><td><code>Platform</code></td><td><code>agent</code>, <code>workflow</code>, <code>listen</code>, <code>start</code>, <code>close</code>, <code>task(id)</code>, <code>workflowRun(id)</code>, <code>startWorkflow(ref, input, opts?)</code>, <code>events</code></td><td>Create through <code>createPlatform</code>. The exported Platform name is a type; kernel services are internal.</td></tr>
+      <tr><td><code>AgentHandle</code></td><td><code>id</code>, <code>name</code>, <code>definition</code>; <code>start / stop / restart</code>, <code>runtime / history</code>, <code>grant / revoke</code>, <code>inbox(status?)</code>, <code>task / send</code></td><td><code>runtime()</code> is current or last runtime in this process, possibly undefined; <code>history()</code> reads durable incarnations.</td></tr>
+      <tr><td><code>TaskRef&lt;In, Out&gt;</code></td><td><code>agent</code>, <code>task</code>, <code>send(input, { idempotencyKey }?)</code></td><td>Reusable operation; accepted by workflow steps and listeners.</td></tr>
+      <tr><td><code>TaskHandle&lt;Out&gt;</code></td><td><code>id</code>, <code>agent</code>, <code>task</code>, <code>info()</code>, <code>result()</code></td><td>One execution. Reattaching with <code>platform.task&lt;Out&gt;(id)</code> asserts a type; it does not validate the result.</td></tr>
+      <tr><td>Workflow builder</td><td><code>input(schema)</code> → <code>step(name, refOrRefs, mapper)</code> → optional <code>output(mapper)</code> → <code>build()</code></td><td>Put <code>output()</code> after all steps. Steps are sequential.</td></tr>
+      <tr><td><code>WorkflowRef</code></td><td><code>name</code>, <code>start(input, opts?)</code>, <code>run(id)</code></td><td>Checked, typed reattachment to its own run.</td></tr>
+      <tr><td><code>WorkflowHandle</code></td><td><code>id</code>, <code>workflow</code>, <code>input / info / steps / events / result</code>, <code>step(name)</code>, <code>task(name)</code></td><td>Narrow step status to <code>completed</code> to access its typed result. Unassigned steps have no task handle.</td></tr>
+      <tr><td><code>ListenerHandle</code></td><td><code>id</code>, <code>name</code>, <code>info</code>, <code>pause / resume</code>, <code>onFire(fn)</code>, <code>take(n)</code></td><td>Fired handle type follows the target: task or workflow.</td></tr>
+    </tbody></table></div>
+    <h3>Error vocabulary</h3>
+    <div class="table-wrap"><table><thead><tr><th>Error</th><th>Where to expect it</th></tr></thead><tbody>
+      <tr><td><code>AgentConfigError</code></td><td>Registration rejects config before changing identity state.</td></tr>
+      <tr><td><code>TaskInputError</code></td><td>Unknown task ref or invalid task input; direct send enqueues nothing.</td></tr>
+      <tr><td><code>WorkflowInputError</code></td><td>Start input fails the workflow schema; no run is started.</td></tr>
+      <tr><td><code>PermanentError</code></td><td>Throw inside a handler to opt out of further deliveries of that task.</td></tr>
+      <tr><td><code>FsDeniedError</code></td><td>Handler receives a permission denial; extends PermanentError and has code <code>EACCES</code>.</td></tr>
+      <tr><td><code>TaskFailedError</code></td><td><code>task.result()</code> rejects on terminal failure; exposes task ID, task name, agent name, last error, and attempts.</td></tr>
+      <tr><td><code>WorkflowFailedError</code></td><td><code>run.result()</code> rejects; exposes workflow ID, name, and stored error.</td></tr>
+      <tr><td><code>WorkflowMismatchError</code></td><td><code>ref.run(id)</code> rejects a mismatched workflow name or definition fingerprint.</td></tr>
+    </tbody></table></div>
+    <p>A handler’s thrown error crosses IPC as text and retryability, not as the original object. Callers await a <code>TaskFailedError</code>; they do not receive the original <code>FsDeniedError</code> instance. Invalid lifecycle operations and unknown IDs can throw ordinary <code>Error</code> objects.</p>
+    <p class="source">Canonical exports: <a href="src/lib/index.ts">src/lib/index.ts</a> · <a href="src/lib/errors.ts">error classes and fields</a></p>
+  </section>
+
+  <section id="code-map">
+    <p class="eyebrow">13 / Read with a purpose</p><h2>A map for your next hour in the code</h2>
+    <div class="table-wrap"><table><thead><tr><th>Question</th><th>Start here</th><th>Then verify with</th></tr></thead><tbody>
+      <tr><td>How does an app use this?</td><td><a href="examples/newsroom/main.ts">newsroom/main.ts</a></td><td><a href="tests/platform.test.ts">platform.test.ts</a></td></tr>
+      <tr><td>How are types inferred?</td><td><a href="src/lib/agent.ts">lib/agent.ts</a>, <a href="src/lib/workflows.ts">lib/workflows.ts</a></td><td><a href="tests/agent.test.ts">agent.test.ts</a>, <a href="tests/library-refs.test.ts">library-refs.test.ts</a></td></tr>
+      <tr><td>How are services connected?</td><td><a href="src/lib/platform.ts">lib/platform.ts</a></td><td><a href="tests/library-workflows.test.ts">library-workflows.test.ts</a></td></tr>
+      <tr><td>What survives a crash?</td><td><a href="src/platform/inbox.ts">inbox.ts</a>, <a href="src/platform/dispatcher.ts">dispatcher.ts</a>, <a href="src/platform/supervisor.ts">supervisor.ts</a></td><td><a href="tests/inbox.test.ts">inbox.test.ts</a>, <a href="tests/dispatcher.test.ts">dispatcher.test.ts</a>, <a href="tests/supervision.test.ts">supervision.test.ts</a></td></tr>
+      <tr><td>What crosses a process boundary?</td><td><a href="src/shared/protocol.ts">shared/protocol.ts</a>, <a href="src/runtime/host.ts">runtime/host.ts</a></td><td><a href="tests/protocol.test.ts">protocol.test.ts</a>, <a href="tests/host.test.ts">host.test.ts</a></td></tr>
+      <tr><td>Where are identity and state modeled?</td><td><a href="src/platform/identity.ts">identity.ts</a>, <a href="src/platform/database.ts">database.ts</a></td><td><a href="tests/identity.test.ts">identity.test.ts</a>, <a href="tests/database.test.ts">database.test.ts</a></td></tr>
+      <tr><td>How do file events become work?</td><td><a href="src/platform/listeners.ts">listeners.ts</a>, <a href="src/platform/filesystem.ts">filesystem.ts</a></td><td><a href="tests/listeners.test.ts">listeners.test.ts</a>, <a href="tests/filesystem.test.ts">filesystem.test.ts</a></td></tr>
+      <tr><td>How does orchestration recover?</td><td><a href="src/platform/workflows.ts">platform/workflows.ts</a></td><td><a href="tests/workflows.test.ts">workflows.test.ts</a>, <a href="tests/library-workflows.test.ts">library-workflows.test.ts</a></td></tr>
+    </tbody></table></div>
+    <h3>Choose a demonstration</h3>
+    <ul><li><code>npm run demo:newsroom</code> — public API, all main features together; no model API required.</li><li><code>npm run demo:support</code> — OpenAI-backed support agents; requires <code>OPENAI_API_KEY</code>, read from <code>.env</code>. See <a href="examples/support-desk/main.ts">main.ts</a> and <a href="examples/support-desk/openai.ts">OpenAI integration</a>.</li><li><code>demo:lifecycle</code>, <code>demo:inbox</code>, <code>demo:fs</code>, <code>demo:listeners</code>, <code>demo:workflows</code> — run with <code>npm run</code>; these wire kernel classes directly to isolate each mechanism. Use them to learn internals.</li></ul>
+    <p>For a change to task delivery, read the inbox and dispatcher tests before editing. For a public API change, inspect the type assertions and runtime cases in the library tests, then run both <code>npm run typecheck</code> and <code>npm test</code>. A runtime pass alone does not establish correct generic inference.</p>
+  </section>
+
+  <section id="boundaries">
+    <p class="eyebrow">14 / Know the edges</p><h2>Small enough to understand, with explicit limits</h2>
+    <p>This codebase is a local teaching platform with meaningful durability boundaries. Treat one platform process as the owner of a database and data root: recovery assumes old claims are stale. WAL does not turn this into a coordinated multi-platform scheduler.</p>
+    <div class="grid two"><article class="card"><h3>Implemented today</h3><p>Named identities and config; supervised processes; durable inboxes; bounded retries; filesystem grants and audit; persisted file listeners; sequential workflows with fallback; typed handles, outputs, and inspection.</p></article><article class="card"><h3>Still future work</h3><p>Persistent sessions and conversations; agent-originated messaging and durable waits; human approvals; general event sources; cancellation and branching; full definition versioning; OS isolation; distributed operation and app hosting.</p></article></div>
+    <p>There is no built-in exactly-once execution, transactional external effect, output schema validation, or restoration of in-memory handler progress. The actor analogy explains identity and message delivery; it does not imply a full Erlang runtime or hostile-code isolation.</p>
+    <h3>Try these three small experiments</h3>
+    <ol><li><strong>Offline delivery:</strong> set <code>autostart: false</code>, start the platform, send a task, inspect its pending state, then call <code>writer.start()</code>.</li><li><strong>Deduplication:</strong> send two different payloads to the same agent with one key. Compare their handle IDs and inspect which input was retained.</li><li><strong>Durable reattachment:</strong> save a task or run ID, close the platform, create a new instance with the same data directory, register the same definitions, start, and inspect the recovered handle.</li></ol>
+    <p>Continue with <a href="README.md">README.md</a> for the project overview, <a href="ARCHITECTURE.md">ARCHITECTURE.md</a> for the original architectural brief, <a href="LIBRARY_PLAN.md">LIBRARY_PLAN.md</a> for library design decisions, and <a href="FUTURE.md">FUTURE.md</a> for proposed work. Names and APIs sketched in the roadmap are not implemented contracts.</p>
+  </section>
+  <footer>mini-agent-runtime · A source-linked field guide · Self-contained HTML, CSS, and JavaScript.<br><a href="#main">Back to the beginning ↑</a></footer>
+</main>
+<script>
+  (() => {
+    const journeys = {
+      success: {
+        status: 'pending → claimed → completed',
+        steps: [
+          ['Validate', 'TaskRef checks the input schema in the caller.'],
+          ['Persist', 'Inbox stores the raw input and returns a stable task ID.'],
+          ['Claim', 'Dispatcher records the runtime incarnation and increments attempts.'],
+          ['Execute', 'Host validates input again, then invokes the handler.'],
+          ['Commit', 'TASK_COMPLETED becomes the stored result, if the incarnation still owns the claim.'],
+          ['Notify', 'Settlement wakes result() waiters and workflow reconciliation.'],
+        ],
+      },
+      crash: {
+        status: 'pending → claimed (#1) → pending → claimed (#2) → completed',
+        steps: [
+          ['Deliver', 'The runtime claims task T on its first attempt.'],
+          ['Crash', 'The process exits before a completion is durably recorded.'],
+          ['Release', 'The exit handler returns the claim to pending, or fails it if attempts are exhausted.'],
+          ['Replace', 'With on-crash policy and restart budget available, the supervisor starts a new incarnation after backoff.'],
+          ['Redeliver', 'The next incarnation receives the same task ID T with a higher attempt number. Handler code runs from the beginning.'],
+          ['Settle', 'Only the incarnation holding the claim can commit. Successful completion resolves the original in-process waiter.'],
+        ],
+      },
+      denied: {
+        status: 'pending → claimed → failed (no task retry)',
+        steps: [
+          ['Deliver', 'The host invokes a handler that calls ctx.fs.read() on a restricted path.'],
+          ['Authorize', 'The platform identifies the caller from IPC, checks the path and grants, and records a denial.'],
+          ['Report', 'FS_RESPONSE carries EACCES; the runtime creates an FsDeniedError.'],
+          ['Fail permanently', 'If the handler does not catch it, the host sends ERROR with retryable: false.'],
+          ['Settle', 'The inbox marks the task failed on this attempt. result() rejects with TaskFailedError.'],
+          ['Consider fallback', 'A workflow containing this task can assign the step to its next candidate; the denied task itself is finished.'],
+        ],
+      },
+    };
+    const target = document.getElementById('trace-content');
+    document.querySelectorAll('[data-scenario]').forEach(button => {
+      button.addEventListener('click', () => {
+        document.querySelectorAll('[data-scenario]').forEach(other => other.setAttribute('aria-pressed', String(other === button)));
+        const journey = journeys[button.dataset.scenario];
+        const status = document.createElement('div');
+        status.className = 'trace-status';
+        status.textContent = journey.status;
+        const list = document.createElement('ol');
+        journey.steps.forEach(([label, text]) => {
+          const item = document.createElement('li');
+          const strong = document.createElement('strong');
+          strong.textContent = label + ': ';
+          item.append(strong, document.createTextNode(text));
+          list.append(item);
+        });
+        target.replaceChildren(status, list);
+      });
+    });
+    const sections = [...document.querySelectorAll('main section')];
+    const links = [...document.querySelectorAll('nav a')];
+    let scheduled = false;
+    function updateReadingPosition() {
+      const range = document.documentElement.scrollHeight - innerHeight;
+      document.getElementById('progress-bar').style.width = (range > 0 ? Math.min(100, Math.max(0, scrollY / range * 100)) : 0) + '%';
+      let current = '';
+      for (const section of sections) if (section.getBoundingClientRect().top <= 160) current = section.id;
+      links.forEach(link => {
+        if (link.hash === '#' + current) link.setAttribute('aria-current', 'location');
+        else link.removeAttribute('aria-current');
+      });
+      scheduled = false;
+    }
+    function scheduleUpdate() {
+      if (!scheduled) { scheduled = true; requestAnimationFrame(updateReadingPosition); }
+    }
+    addEventListener('scroll', scheduleUpdate, { passive: true });
+    addEventListener('resize', scheduleUpdate);
+    updateReadingPosition();
+  })();
+</script>
+</body>
+</html>
